@@ -1,11 +1,4 @@
-"""ModelRunner: owns the model, memory pools and attention backend.
-Mirrors sglang/srt/model_executor/model_runner.py (reduced).
-
-Order of initialisation, as in SGLang: load weights -> measure free memory ->
-size the KV pool from `mem_fraction_static` -> build pools -> build attention backend.
-CUDA graphs are added in Phase 7.
-"""
-
+"""model runner"""
 from __future__ import annotations
 
 import logging
@@ -13,6 +6,7 @@ from typing import Optional
 
 import torch
 
+from lula.distributed import all_reduce_min_int, init_distributed_environment
 from lula.models.model_config import ModelConfig
 from lula.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from lula.layers.attention.triton_backend import TritonAttnBackend
@@ -42,10 +36,17 @@ def get_total_gpu_memory(device: torch.device) -> float:
 
 
 class ModelRunner:
-    def __init__(self, model_config: ModelConfig, server_args: ServerArgs, device: str = "cuda"):
+    def __init__(self, model_config: ModelConfig, server_args: ServerArgs, device: str = "cuda", tp_rank: int = 0):
         self.model_config = model_config
         self.server_args = server_args
+        self.tp_size = server_args.tp_size
+        self.tp_rank = tp_rank
         self.device = torch.device(device)
+        if self.tp_size > 1 and self.device.type == "cuda" and self.device.index is None:
+            self.device = torch.device("cuda", server_args.base_gpu_id + tp_rank)
+        init_distributed_environment(self.tp_size, tp_rank, server_args.dist_init_addr, self.device)
+        self.num_attention_heads = model_config.get_num_attention_heads(self.tp_size)
+        self.num_kv_heads = model_config.get_num_kv_heads(self.tp_size)
         self.dtype = model_config.dtype
         self.kv_cache_dtype = self._resolve_kv_dtype(server_args.kv_cache_dtype)
         if server_args.random_seed is not None:
@@ -73,7 +74,7 @@ class ModelRunner:
     def kv_cell_size_bytes(self) -> int:
         cfg = self.model_config
         return MHATokenToKVPool.cell_size_bytes(
-            cfg.num_key_value_heads, cfg.head_dim, len(cfg.full_attention_layer_ids), self.kv_cache_dtype
+            self.num_kv_heads, cfg.head_dim, len(cfg.full_attention_layer_ids), self.kv_cache_dtype
         )
 
     def profile_max_num_token(self, total_gpu_memory: float) -> int:
@@ -87,7 +88,9 @@ class ModelRunner:
         return max_num_token
 
     def init_memory_pool(self, total_gpu_memory: float, max_num_reqs: Optional[int], max_total_tokens: Optional[int]):
-        self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
+        # All ranks must agree on the pool size: the scheduler on every rank
+        # replays the same allocations and expects the same free lists.
+        self.max_total_num_tokens = all_reduce_min_int(self.profile_max_num_token(total_gpu_memory))
         if max_total_tokens is not None:
             if max_total_tokens > self.max_total_num_tokens:
                 logger.warning("max_total_tokens=%d exceeds profiled %d; capping", max_total_tokens, self.max_total_num_tokens)
@@ -110,7 +113,7 @@ class ModelRunner:
             self.max_total_num_tokens,
             page_size=1,
             dtype=self.kv_cache_dtype,
-            head_num=cfg.num_key_value_heads,
+            head_num=self.num_kv_heads,
             head_dim=cfg.head_dim,
             layer_num=cfg.num_hidden_layers,
             device=self.device,

@@ -1,14 +1,4 @@
-"""Continuous-batching scheduler, its admission policy, and the process entry point.
-Mirrors sglang/srt/managers/scheduler.py (reduced).
-
-One scheduler step is: build a batch (running decode requests merged with new
-prefill requests) -> run it on the model -> process the sampled tokens. Chunked
-prefill splits long prompts across steps; `retract_decode` moves requests back to
-the waiting queue when the KV pool cannot serve a decode step. `SchedulePolicy` /
-`PrefillAdder` choose what to admit each step, and `run_scheduler_process` is the
-ZMQ loop that owns the GPU inside the scheduler worker process.
-"""
-
+"""Scheduler"""
 from __future__ import annotations
 
 import logging
@@ -34,6 +24,7 @@ from lula.mem_cache.radix_cache import ChunkCache, RadixCache
 from lula.model_executor.forward_batch_info import ForwardBatch
 from lula.model_executor.model_runner import ModelRunner
 from lula.sampling.sampling_params import SamplingParams
+from lula.distributed import broadcast_pyobj, tensor_model_parallel_broadcast
 from lula.utils import new_generator
 
 logger = logging.getLogger(__name__)
@@ -91,9 +82,14 @@ class TpModelWorker:
     scheduler never sees whether a drafter is running (Phase 8 plugs in here).
     """
 
-    def __init__(self, model_config, server_args, device: str = "cuda"):
-        self.model_runner = ModelRunner(model_config, server_args, device=device)
+    def __init__(self, model_config, server_args, device: str = "cuda", tp_rank: int = 0):
+        self.model_runner = ModelRunner(model_config, server_args, device=device, tp_rank=tp_rank)
         self.sampler = Sampler()
+
+    def _sync_token_ids(self, next_token_ids: torch.Tensor) -> torch.Tensor:
+        # Logits are identical on every rank, but sampling RNG is per-process;
+        # rank 0's tokens are authoritative so every rank's scheduler agrees.
+        return tensor_model_parallel_broadcast(next_token_ids.contiguous(), src=0)
 
     @torch.inference_mode()
     def forward_batch_generation(self, model_worker_batch) -> GenerationBatchResult:
@@ -102,8 +98,9 @@ class TpModelWorker:
         sampling_info = model_worker_batch.sampling_info
         if sampling_info is None or len(sampling_info) == 0:
             next_token_ids = torch.argmax(logits_output.next_token_logits, dim=-1)
-            return GenerationBatchResult(logits_output, next_token_ids)
+            return GenerationBatchResult(logits_output, self._sync_token_ids(next_token_ids))
         sampler_output = self.sampler(logits_output.next_token_logits, sampling_info)
+        sampler_output.next_token_ids = self._sync_token_ids(sampler_output.next_token_ids)
         return GenerationBatchResult(logits_output, sampler_output.next_token_ids, sampler_output)
 
 
@@ -132,13 +129,13 @@ class _RequestItem:
 
 
 class Scheduler:
-    def __init__(self, model_config, server_args, device: str = "cuda"):
+    def __init__(self, model_config, server_args, device: str = "cuda", tp_rank: int = 0):
         self.model_config = model_config
         self.server_args = server_args
-        self.device = torch.device(device)
 
-        self.worker = TpModelWorker(model_config, server_args, device=device)
+        self.worker = TpModelWorker(model_config, server_args, device=device, tp_rank=tp_rank)
         self.model_runner = self.worker.model_runner
+        self.device = self.model_runner.device
         self.req_to_token = self.model_runner.req_to_token_pool.req_to_token
         self.token_to_kv_pool_allocator = self.model_runner.token_to_kv_pool_allocator
 
@@ -634,35 +631,45 @@ def run_scheduler_process(
     recv_endpoint: str,
     send_endpoint: str,
     stop_event: Optional[threading.Event] = None,
+    tp_rank: int = 0,
 ) -> None:
+    # Only rank 0 is wired to the tokenizer/detokenizer; the other ranks get
+    # their inputs from rank 0's broadcast each iteration.
     context = zmq.Context()
-    recv = context.socket(zmq.PULL)
-    recv.bind(f"ipc://{recv_endpoint}")
-    send = context.socket(zmq.PUSH)
-    send.connect(f"ipc://{send_endpoint}")
+    recv = send = poller = None
+    if tp_rank == 0:
+        recv = context.socket(zmq.PULL)
+        recv.bind(f"ipc://{recv_endpoint}")
+        send = context.socket(zmq.PUSH)
+        send.connect(f"ipc://{send_endpoint}")
+        poller = zmq.Poller()
+        poller.register(recv, zmq.POLLIN)
 
-    scheduler = Scheduler(model_config, server_args)
-    poller = zmq.Poller()
-    poller.register(recv, zmq.POLLIN)
+    scheduler = Scheduler(model_config, server_args, tp_rank=tp_rank)
     prev = None
-    logger.info("scheduler ready")
+    logger.info("scheduler ready (tp rank %d/%d)", tp_rank, server_args.tp_size)
 
     try:
         while stop_event is None or not stop_event.is_set():
-            if dict(poller.poll(timeout=0)).get(recv) == zmq.POLLIN:
+            msgs: List = []
+            if tp_rank == 0 and dict(poller.poll(timeout=0)).get(recv) == zmq.POLLIN:
                 while True:
                     try:
-                        msg = recv.recv_pyobj(zmq.NOBLOCK)
+                        msgs.append(recv.recv_pyobj(zmq.NOBLOCK))
                     except zmq.Again:
                         break
-                    if isinstance(msg, TokenizedGenerateReqInput):
-                        scheduler.add_request(
-                            msg.rid, msg.input_ids, msg.sampling_params, msg.stream
-                        )
-                    elif isinstance(msg, AbortReq):
-                        scheduler.abort_request(msg.rid)
-                    elif isinstance(msg, FlushCacheReq):
-                        scheduler.flush_cache()
+            # Lockstep point: every rank sees the same messages in the same
+            # order before scheduling this iteration.
+            msgs = broadcast_pyobj(msgs, tp_rank, src=0)
+            for msg in msgs:
+                if isinstance(msg, TokenizedGenerateReqInput):
+                    scheduler.add_request(
+                        msg.rid, msg.input_ids, msg.sampling_params, msg.stream
+                    )
+                elif isinstance(msg, AbortReq):
+                    scheduler.abort_request(msg.rid)
+                elif isinstance(msg, FlushCacheReq):
+                    scheduler.flush_cache()
 
             if scheduler.enable_overlap:
                 prev = scheduler.overlap_step(prev)
@@ -675,7 +682,7 @@ def run_scheduler_process(
                     outs.append(scheduler.output_queue.get_nowait())
                 except Exception:
                     break
-            if outs:
+            if outs and tp_rank == 0:
                 send.send_pyobj(BatchTokenIDOut(
                     rids=[o.rid for o in outs],
                     output_ids=[o.new_token_ids for o in outs],
@@ -688,7 +695,8 @@ def run_scheduler_process(
             if not ran:
                 time.sleep(0.0005)
     finally:
-        recv.close(linger=0)
-        send.close(linger=0)
+        if recv is not None:
+            recv.close(linger=0)
+        if send is not None:
+            send.close(linger=0)
         context.term()
-

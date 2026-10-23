@@ -11,12 +11,13 @@ from torch import nn
 from lula.models.model_config import ModelConfig
 
 from lula.layers.layernorm import RMSNorm
-from lula.layers.linear import LinearBase, MergedColumnParallelLinear, QKVParallelLinear, default_weight_loader
+from lula.layers.linear import MergedColumnParallelLinear, QKVParallelLinear, RowParallelLinear, default_weight_loader
 from lula.layers.logits_processor import LogitsProcessorOutput
 from lula.layers.quantization.base import QuantizationConfig
 from lula.layers.radix_attention import RadixAttention
 from lula.layers.rotary import get_rope
 from lula.layers.vocab_embedding import ParallelLMHead, VocabParallelEmbedding
+from lula.distributed import get_tp_info
 from lula.model_executor.forward_batch_info import ForwardBatch
 from lula.models.registry import ModelRegistry
 
@@ -27,7 +28,7 @@ class LlamaMLP(nn.Module):
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size, [intermediate_size] * 2, bias=False, quant_config=quant_config, prefix=f"{prefix}.gate_up_proj")
-        self.down_proj = LinearBase(
+        self.down_proj = RowParallelLinear(
             intermediate_size, hidden_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.down_proj")
         if hidden_act != "silu":
             raise ValueError(f"Unsupported activation {hidden_act!r}")
@@ -45,8 +46,9 @@ class LlamaAttention(nn.Module):
                  quant_config: Optional[QuantizationConfig] = None, prefix: str = ""):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.num_kv_heads = config.num_key_value_heads
+        tp_size, _ = get_tp_info()
+        self.num_heads = config.get_num_attention_heads(tp_size)
+        self.num_kv_heads = config.get_num_kv_heads(tp_size)
         self.head_dim = config.head_dim
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
@@ -56,8 +58,8 @@ class LlamaAttention(nn.Module):
         self.qkv_proj = QKVParallelLinear(
             self.hidden_size, self.head_dim, self.num_heads, self.num_kv_heads,
             bias=config.attention_bias, quant_config=quant_config, prefix=f"{prefix}.qkv_proj")
-        self.o_proj = LinearBase(
-            self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias,
+        self.o_proj = RowParallelLinear(
+            config.num_attention_heads * self.head_dim, self.hidden_size, bias=config.attention_bias,
             quant_config=quant_config, prefix=f"{prefix}.o_proj")
         self.rotary_emb = get_rope(
             self.head_dim, rotary_dim=config.rotary_dim, max_position=config.context_len,
@@ -153,8 +155,7 @@ class LlamaForCausalLMBase(nn.Module):
         else:
             last_index = forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
             last_hidden = hidden_states[last_index]
-        logits = F.linear(last_hidden, self.lm_head.weight, self.lm_head.bias)
-        logits = logits[:, : self.config.vocab_size].float()
+        logits = self.lm_head.compute_logits(last_hidden)
         return LogitsProcessorOutput(next_token_logits=logits)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Tuple[Set[str], Set[str]]:

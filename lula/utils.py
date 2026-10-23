@@ -32,3 +32,9 @@ def longest_partial_suffix(text: str, delimiter: str) -> int:
         if text.endswith(delimiter[:length]):
             return length
     return 0
+
+
+def ceil_div(a: int, b: int) -> int:
+    if b == 0:
+        raise ValueError("b can't be zero")
+    return -(-a // b)

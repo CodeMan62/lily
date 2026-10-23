@@ -1,7 +1,7 @@
 """Linear layers with SGLang/vLLM names and weight-loader semantics.
 
-Single-GPU for now (tp_size = 1), but shard ids and loaders are kept so the
-weight-loading code in models/ is the same one that will work under TP.
+Under TP the loader hands each layer only its rank's shard of the checkpoint
+(see models/loader.py), so layers just size their params per rank.
 Every forward returns `(output, output_bias)` like SGLang; `output_bias` is
 only non-None when `skip_bias_add=True`.
 """
@@ -13,6 +13,7 @@ from typing import List, Optional, Tuple
 import torch
 from torch import nn
 
+from lula.distributed import get_tp_info, tensor_model_parallel_all_reduce
 from lula.layers.quantization.base import LinearMethodBase, QuantizationConfig, get_linear_method
 
 
@@ -60,8 +61,9 @@ class MergedColumnParallelLinear(LinearBase):
     """Several column-parallel linears fused along the output dim (e.g. gate_proj + up_proj)."""
 
     def __init__(self, input_size: int, output_sizes: List[int], bias: bool, **kw):
-        self.output_sizes = list(output_sizes)
-        super().__init__(input_size, sum(output_sizes), bias, **kw)
+        tp_size, _ = get_tp_info()
+        self.output_sizes = [size // tp_size for size in output_sizes]
+        super().__init__(input_size, sum(self.output_sizes), bias, **kw)
 
     def weight_loader(self, param, loaded_weight, loaded_shard_id: Optional[int] = None):
         if loaded_shard_id is None:
@@ -104,3 +106,18 @@ class QKVParallelLinear(LinearBase):
         off, size = offsets[loaded_shard_id], sizes[loaded_shard_id]
         assert loaded_weight.shape[0] == size, (loaded_shard_id, loaded_weight.shape, size)
         param.data.narrow(0, off, size).copy_(loaded_weight)
+
+
+class RowParallelLinear(LinearBase):
+    """Input dim split across TP ranks (o_proj, down_proj); partial outputs are all-reduced."""
+
+    def __init__(self, input_size: int, output_size: int, bias: bool, **kw):
+        tp_size, _ = get_tp_info()
+        super().__init__(input_size // tp_size, output_size, bias, **kw)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        out = tensor_model_parallel_all_reduce(self.quant_method.apply(self, x))
+        # Bias is replicated, so add it once after the reduce.
+        if self.bias is not None and not self.skip_bias_add:
+            out = out + self.bias
+        return out, (self.bias if self.skip_bias_add else None)

@@ -2,6 +2,8 @@
 
     tokenizer/HTTP process ──▶ scheduler process ──▶ detokenizer process ──▶ HTTP
 
+With `--tp-size N` there are N scheduler processes (one per GPU); only rank 0
+is connected to the tokenizer and detokenizer, the rest follow its broadcasts.
 All inter-process links are ZMQ ipc sockets. Mirrors sglang/srt/entrypoints/engine.py.
 """
 
@@ -41,23 +43,27 @@ def make_endpoints(prefix: Optional[str] = None) -> Endpoints:
 
 
 def launch_scheduler_and_detokenizer(model_config, server_args, endpoints: Endpoints):
-    """Start the two worker processes; returns them for supervision/shutdown."""
+    """Start the scheduler (one per TP rank) and detokenizer processes; returns them for supervision/shutdown."""
     ctx = mp.get_context("spawn")
-    scheduler = ctx.Process(
-        target=run_scheduler_process,
-        args=(model_config, server_args, endpoints.req, endpoints.token),
-        daemon=True,
-        name="lula-scheduler",
-    )
+    schedulers = [
+        ctx.Process(
+            target=run_scheduler_process,
+            args=(model_config, server_args, endpoints.req, endpoints.token, None, tp_rank),
+            daemon=True,
+            name=f"lula-scheduler-tp{tp_rank}",
+        )
+        for tp_rank in range(server_args.tp_size)
+    ]
     detokenizer = ctx.Process(
         target=run_detokenizer_process,
         args=(server_args.tokenizer_path, endpoints.token, endpoints.text),
         daemon=True,
         name="lula-detokenizer",
     )
-    scheduler.start()
+    for p in schedulers:
+        p.start()
     detokenizer.start()
-    return scheduler, detokenizer
+    return (*schedulers, detokenizer)
 
 
 def serve(model_path: str, server_args=None, host: Optional[str] = None,

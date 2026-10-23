@@ -22,7 +22,7 @@ class TritonAttnBackend(AttentionBackend):
         self.device = model_runner.device
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.token_to_kv_pool = model_runner.token_to_kv_pool
-        self.num_q_heads = model_runner.model_config.num_attention_heads
+        self.num_q_heads = model_runner.num_attention_heads  # per TP rank
         self.v_head_dim = model_runner.model_config.head_dim
         self.num_kv_splits = num_kv_splits
         self.forward_metadata = None

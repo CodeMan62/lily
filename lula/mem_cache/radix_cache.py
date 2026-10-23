@@ -12,10 +12,15 @@ those duplicate indices and must free them.
 from __future__ import annotations
 
 import heapq
-import time
+import itertools
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
+
+# Logical clock for LRU instead of wall time: the order is the same, but it is
+# reproducible, so TP ranks replaying the same scheduler steps evict the same nodes.
+_access_clock = itertools.count()
+_node_ids = itertools.count()
 
 
 class TreeNode:
@@ -30,14 +35,15 @@ class TreeNode:
         self.parent: Optional[TreeNode] = parent
         self.children: Dict[int, "TreeNode"] = {}
         self.lock_ref: int = 0
-        self.last_access_time: float = time.monotonic()
+        self.node_id: int = next(_node_ids)
+        self.last_access_time: int = next(_access_clock)
 
     @property
     def value_len(self) -> int:
         return int(self.value.numel())
 
     def touch(self) -> None:
-        self.last_access_time = time.monotonic()
+        self.last_access_time = next(_access_clock)
 
 
 class RadixCache:
@@ -172,7 +178,7 @@ class RadixCache:
         if num_tokens <= 0:
             return 0
         freed = 0
-        heap = [(leaf.last_access_time, id(leaf), leaf) for leaf in self._collect_leaves()]
+        heap = [(leaf.last_access_time, leaf.node_id, leaf) for leaf in self._collect_leaves()]
         heapq.heapify(heap)
         while heap and freed < num_tokens:
             _, _, node = heapq.heappop(heap)
@@ -186,7 +192,7 @@ class RadixCache:
                 del parent.children[node.key[0]]
             node.parent = None
             if parent is not self.root_node and not parent.children and parent.lock_ref == 0:
-                heapq.heappush(heap, (parent.last_access_time, id(parent), parent))
+                heapq.heappush(heap, (parent.last_access_time, parent.node_id, parent))
         return freed
 
     def clear(self) -> None:

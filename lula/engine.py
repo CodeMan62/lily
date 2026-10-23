@@ -12,10 +12,10 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 import torch
-import torch.nn.functional as F
 from transformers import AutoTokenizer
 
 from lula.models.model_config import ModelConfig
+from lula.distributed import DEFAULT_DIST_INIT_ADDR
 from lula.model_executor.forward_batch_info import ForwardBatch
 from lula.model_executor.model_runner import ModelRunner
 from lula.server_args import ServerArgs
@@ -31,7 +31,9 @@ class EngineConfig:
     max_running_requests: int = 2
     max_total_tokens: Optional[int] = None
     mem_fraction_static: Optional[float] = None
-
+    tp_size: int = 1
+    rank: int = 0
+    dist_init_addr: str = DEFAULT_DIST_INIT_ADDR
 
 class Engine:
     def __init__(self, config: EngineConfig):
@@ -41,11 +43,13 @@ class Engine:
                                       context_length=config.context_length,
                                       max_running_requests=config.max_running_requests,
                                       max_total_tokens=config.max_total_tokens,
-                                      mem_fraction_static=config.mem_fraction_static)
+                                      mem_fraction_static=config.mem_fraction_static,
+                                      tp_size=config.tp_size,
+                                      dist_init_addr=config.dist_init_addr)
         self.model_config = ModelConfig.from_pretrained(config.model_path, dtype=config.dtype,
                                                         context_length=config.context_length)
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_config.model_path)
-        self.runner = ModelRunner(self.model_config, self.server_args, device=config.device)
+        self.runner = ModelRunner(self.model_config, self.server_args, device=config.device, tp_rank=config.rank)
         self.device = self.runner.device
 
     # ---- KV bookkeeping -----------------------------------------------------
@@ -99,8 +103,7 @@ class Engine:
             hidden = self.runner.model.model(fb.input_ids, fb.positions, fb)
         finally:
             self._release(req_idx, len(prompt_ids))
-        lm_head = self.runner.model.lm_head
-        return F.linear(hidden, lm_head.weight, lm_head.bias).float()
+        return self.runner.model.lm_head.compute_logits(hidden)
 
     @torch.inference_mode()
     def generate_greedy(self, prompt_ids: List[int], max_new_tokens: int, ignore_eos: bool = True) -> List[int]:

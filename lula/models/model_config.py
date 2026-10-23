@@ -157,6 +157,13 @@ class ModelConfig:
             return list(range(self.num_hidden_layers))
         return [i for i, t in enumerate(self.layer_types) if t == "full_attention"]
 
+    def get_num_attention_heads(self, tp_size: int) -> int:
+        return self.num_attention_heads // tp_size
+
+    def get_num_kv_heads(self, tp_size: int) -> int:
+        # With fewer KV heads than TP ranks, each rank holds one replicated head.
+        return max(1, self.num_key_value_heads // tp_size)
+
     def summary(self) -> str:
         return (
             f"{self.architectures} type={self.model_type} layers={self.num_hidden_layers} "

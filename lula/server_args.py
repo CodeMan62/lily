@@ -10,6 +10,8 @@ import dataclasses
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+from lula.distributed import DEFAULT_DIST_INIT_ADDR
+
 
 @dataclass
 class ServerArgs:
@@ -66,6 +68,11 @@ class ServerArgs:
     # Device
     device: str = "cuda"
 
+    # Parallelism
+    tp_size: int = 1
+    base_gpu_id: int = 0
+    dist_init_addr: str = DEFAULT_DIST_INIT_ADDR  # host:port for the torch.distributed TCP store
+
     def __post_init__(self):
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
@@ -106,6 +113,8 @@ class ServerArgs:
             raise ValueError(f"Unknown schedule policy {self.schedule_policy!r}")
         if self.attention_backend not in ("triton", "torch_native"):
             raise ValueError(f"Unknown attention backend {self.attention_backend!r}")
+        if self.tp_size < 1:
+            raise ValueError("tp_size must be >= 1")
         if self.dtype not in ("auto", "bfloat16", "float16", "float32"):
             raise ValueError(f"Unknown dtype {self.dtype!r}")
 
