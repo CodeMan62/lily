@@ -22,9 +22,10 @@ def main() -> None:
     parser = argparse.ArgumentParser("lula chat example")
     parser.add_argument("--base-url", default="http://127.0.0.1:30000/v1")
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B", help="served model name")
-    parser.add_argument("--max-tokens", type=int, default=256)
+    parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--no-stream", action="store_true", help="wait for the whole answer")
+    parser.add_argument("--no-think", action="store_true", help="disable Qwen3 thinking mode")
     args = parser.parse_args()
 
     client = openai.Client(base_url=args.base_url, api_key="none")
@@ -49,25 +50,38 @@ def main() -> None:
 
         messages.append({"role": "user", "content": question})
         print("bot> ", end="", flush=True)
+        extra: dict = {}
+        if args.no_think:
+            extra["chat_template_kwargs"] = {"enable_thinking": False}
 
         if args.no_stream:
             reply = client.chat.completions.create(
                 model=args.model, messages=messages,
-                max_tokens=args.max_tokens, temperature=args.temperature,
+                max_tokens=args.max_tokens, temperature=args.temperature, **extra,
             )
-            answer = reply.choices[0].message.content
+            message = reply.choices[0].message
+            if getattr(message, "reasoning_content", None):
+                print(f"\033[2m(thinking) {message.reasoning_content}\033[0m")
+            answer = message.content
             print(answer)
         else:
             stream = client.chat.completions.create(
                 model=args.model, messages=messages,
-                max_tokens=args.max_tokens, temperature=args.temperature, stream=True,
+                max_tokens=args.max_tokens, temperature=args.temperature, stream=True, **extra,
             )
             answer = ""
+            reasoning = ""
+            shown_thinking = False
             for chunk in stream:
                 delta = chunk.choices[0].delta
                 if delta.content:
+                    if reasoning and not shown_thinking:
+                        print(f"\033[2m(thinking) {reasoning}\033[0m", end="\n\n")
+                        shown_thinking = True
                     answer += delta.content
                     print(delta.content, end="", flush=True)
+                elif getattr(delta, "reasoning_content", None):
+                    reasoning += delta.reasoning_content
             print()
 
         messages.append({"role": "assistant", "content": answer})
