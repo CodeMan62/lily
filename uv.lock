@@ -356,7 +356,7 @@ wheels = [
 ]
 
 [[package]]
-name = "lula"
+name = "lily"
 version = "0.0.1"
 source = { editable = "." }
 dependencies = [

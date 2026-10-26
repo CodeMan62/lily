@@ -11,14 +11,14 @@ import random
 
 import torch
 
-from lula.models.model_config import ModelConfig
-from lula.layers.attention.torch_native_backend import TorchNativeAttnBackend
-from lula.layers.attention.triton_backend import TritonAttnBackend
-from lula.scheduler.scheduler import Scheduler
-from lula.model_executor.forward_batch_info import ForwardBatch
-from lula.model_executor.model_runner import ModelRunner
-from lula.sampling.sampling_params import SamplingParams
-from lula.server_args import ServerArgs
+from lily.models.model_config import ModelConfig
+from lily.layers.attention.torch_native_backend import TorchNativeAttnBackend
+from lily.layers.attention.triton_backend import TritonAttnBackend
+from lily.scheduler.scheduler import Scheduler
+from lily.model_executor.forward_batch_info import ForwardBatch
+from lily.model_executor.model_runner import ModelRunner
+from lily.sampling.sampling_params import SamplingParams
+from lily.server_args import ServerArgs
 from tests.models import SMALL_LLAMA
 from tests.util import free_cuda
 

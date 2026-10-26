@@ -2,7 +2,7 @@
 
 import argparse
 
-from lula.models.model_config import ModelConfig
+from lily.models.model_config import ModelConfig
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()

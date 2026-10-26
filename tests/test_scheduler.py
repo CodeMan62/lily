@@ -14,11 +14,11 @@ import random
 
 import torch
 
-from lula.models.model_config import ModelConfig
-from lula.scheduler.schedule_batch import Req
-from lula.scheduler.scheduler import PrefillAdder, SchedulePolicy, Scheduler
-from lula.sampling.sampling_params import SamplingParams
-from lula.server_args import ServerArgs
+from lily.models.model_config import ModelConfig
+from lily.scheduler.schedule_batch import Req
+from lily.scheduler.scheduler import PrefillAdder, SchedulePolicy, Scheduler
+from lily.sampling.sampling_params import SamplingParams
+from lily.server_args import ServerArgs
 from tests.models import SMALL_LLAMA
 from tests.util import free_cuda
 

@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
-# Throughput sweep: start a lula server, fire 1/8/32/64 concurrent requests, print a table.
+# Throughput sweep: start a lily server, fire 1/8/32/64 concurrent requests, print a table.
 #
 #   bench/bench.sh Qwen/Qwen3-0.6B
 #   bench/bench.sh Qwen/Qwen2.5-0.5B-Instruct --max-running-requests 128
 #
-# Extra args go straight to lula-serve. Env: PORT (30000), MAX_TOKENS (256).
+# Extra args go straight to lily-serve. Env: PORT (30000), MAX_TOKENS (256).
 # Overlap scheduling is disabled by default (it currently crashes the scheduler).
 set -euo pipefail
 
-MODEL="${1:?usage: bench/bench.sh <model-path> [lula-serve args...]}"
+MODEL="${1:?usage: bench/bench.sh <model-path> [lily-serve args...]}"
 shift
 PORT="${PORT:-30000}"
 MAX_TOKENS="${MAX_TOKENS:-256}"
-LOG="$(mktemp -t lula-bench.XXXXXX.log)"
+LOG="$(mktemp -t lily-bench.XXXXXX.log)"
 cd "$(dirname "$0")/.."
 
 # New session so the whole server tree (uv, uvicorn, scheduler workers) dies together.
-setsid uv run lula-serve --model-path "$MODEL" --dtype bfloat16 --port "$PORT" \
+setsid uv run lily-serve --model-path "$MODEL" --dtype bfloat16 --port "$PORT" \
   --disable-overlap-schedule "$@" >"$LOG" 2>&1 &
 SERVER_PID=$!
 # SIGKILL: uvicorn waits forever on in-flight requests after SIGTERM.

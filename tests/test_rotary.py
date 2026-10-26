@@ -4,7 +4,7 @@ import torch
 from transformers import PretrainedConfig
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
-from lula.layers.rotary import get_rope
+from lily.layers.rotary import get_rope
 
 HEAD, BASE, MAXPOS = 128, 500000.0, 8192
 

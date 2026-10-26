@@ -13,12 +13,12 @@ import random
 import torch
 from transformers.generation.logits_process import RepetitionPenaltyLogitsProcessor
 
-from lula.models.model_config import ModelConfig
-from lula.layers.sampler import Sampler
-from lula.scheduler.scheduler import Scheduler
-from lula.sampling.sampling_batch_info import SamplingBatchInfo
-from lula.sampling.sampling_params import SamplingParams
-from lula.server_args import ServerArgs
+from lily.models.model_config import ModelConfig
+from lily.layers.sampler import Sampler
+from lily.scheduler.scheduler import Scheduler
+from lily.sampling.sampling_batch_info import SamplingBatchInfo
+from lily.sampling.sampling_params import SamplingParams
+from lily.server_args import ServerArgs
 from tests.models import SMALL_LLAMA
 from tests.util import free_cuda
 

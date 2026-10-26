@@ -12,11 +12,11 @@ from typing import List
 
 import torch
 
-from lula.models.model_config import ModelConfig
-from lula.scheduler.scheduler import Scheduler
-from lula.mem_cache.radix_cache import RadixCache
-from lula.sampling.sampling_params import SamplingParams
-from lula.server_args import ServerArgs
+from lily.models.model_config import ModelConfig
+from lily.scheduler.scheduler import Scheduler
+from lily.mem_cache.radix_cache import RadixCache
+from lily.sampling.sampling_params import SamplingParams
+from lily.server_args import ServerArgs
 from tests.models import SMALL_LLAMA
 from tests.util import free_cuda
 

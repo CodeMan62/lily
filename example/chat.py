@@ -1,8 +1,8 @@
-"""Interactive chat with a lula server.
+"""Interactive chat with a lily server.
 
 Start the server in one terminal:
 
-    uv run lula-serve --model-path Qwen/Qwen3-0.6B --dtype bfloat16
+    uv run lily-serve --model-path Qwen/Qwen3-0.6B --dtype bfloat16
 
 Then run this file in another:
 
@@ -19,7 +19,7 @@ import openai
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser("lula chat example")
+    parser = argparse.ArgumentParser("lily chat example")
     parser.add_argument("--base-url", default="http://127.0.0.1:30000/v1")
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B", help="served model name")
     parser.add_argument("--max-tokens", type=int, default=2048)
@@ -31,7 +31,7 @@ def main() -> None:
     client = openai.Client(base_url=args.base_url, api_key="none")
     messages: list[dict] = []
 
-    print("lula chat. /reset to clear the history, /exit to quit.\n")
+    print("lily chat. /reset to clear the history, /exit to quit.\n")
     while True:
         try:
             question = input("you> ").strip()

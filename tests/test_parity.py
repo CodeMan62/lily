@@ -1,4 +1,4 @@
-"""Phase 1 acceptance: lula's model matches HF transformers.
+"""Phase 1 acceptance: lily's model matches HF transformers.
 
 fp32: all-position logits close, and 100 greedy tokens identical.
 bf16: argmax agreement over the prompt positions (bf16 numerics differ by kernel order,
@@ -9,7 +9,7 @@ import pytest
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from lula.engine import Engine, EngineConfig
+from lily.engine import Engine, EngineConfig
 from tests.models import SMALL_LLAMA, SMALL_QWEN3
 from tests.util import free_cuda
 

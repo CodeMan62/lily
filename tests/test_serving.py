@@ -19,19 +19,19 @@ import pytest
 import uvicorn
 from transformers import AutoTokenizer
 
-from lula.models.model_config import ModelConfig
-from lula.entrypoints.http_server import create_app
-from lula.entrypoints.launch import make_endpoints
-from lula.scheduler.detokenizer import (
+from lily.models.model_config import ModelConfig
+from lily.entrypoints.http_server import create_app
+from lily.entrypoints.launch import make_endpoints
+from lily.scheduler.detokenizer import (
     DecodeStatus,
     DetokenizerFrontend,
     run_detokenizer_process,
 )
-from lula.scheduler.io_struct import BatchTokenIDOut
-from lula.scheduler.scheduler import run_scheduler_process
-from lula.scheduler.tokenizer import TokenizerFrontend
-from lula.parsers.reasoning_parser import ReasoningParser
-from lula.server_args import ServerArgs
+from lily.scheduler.io_struct import BatchTokenIDOut
+from lily.scheduler.scheduler import run_scheduler_process
+from lily.scheduler.tokenizer import TokenizerFrontend
+from lily.parsers.reasoning_parser import ReasoningParser
+from lily.server_args import ServerArgs
 from tests.models import SMALL_LLAMA
 from tests.util import free_cuda
 
@@ -93,10 +93,10 @@ def client():
     sa = ServerArgs(
         model_path=MODEL, dtype="float32", attention_backend="triton", context_length=1024,
         max_running_requests=8, max_total_tokens=4096, chunked_prefill_size=2048,
-        served_model_name="lula-test",
+        served_model_name="lily-test",
     )
 
-    endpoints = make_endpoints(prefix=f"/tmp/lula_test_{uuid.uuid4().hex[:8]}")
+    endpoints = make_endpoints(prefix=f"/tmp/lily_test_{uuid.uuid4().hex[:8]}")
     stop = threading.Event()
     workers = [
         threading.Thread(target=run_scheduler_process,
@@ -136,13 +136,13 @@ def run_detokenizer(tokenizer, recv, send, stop):
 @pytest.mark.timeout(300)
 def test_http_client_non_streaming(client):
     resp = client.completions.create(
-        model="lula-test", prompt="The capital of France is", max_tokens=8, temperature=0.0,
+        model="lily-test", prompt="The capital of France is", max_tokens=8, temperature=0.0,
     )
     assert isinstance(resp.choices[0].text, str) and resp.choices[0].text
     assert resp.usage.completion_tokens > 0
 
     chat = client.chat.completions.create(
-        model="lula-test", messages=[{"role": "user", "content": "Say hello."}],
+        model="lily-test", messages=[{"role": "user", "content": "Say hello."}],
         max_tokens=8, temperature=0.0,
     )
     content = chat.choices[0].message.content
@@ -154,24 +154,24 @@ def test_http_client_non_streaming(client):
 def test_http_streaming_equals_non_streaming(client):
     prompt = "The quick brown fox"
     non_stream = client.completions.create(
-        model="lula-test", prompt=prompt, max_tokens=16, temperature=0.0,
+        model="lily-test", prompt=prompt, max_tokens=16, temperature=0.0,
     ).choices[0].text
     streamed = "".join(
         chunk.choices[0].text or ""
         for chunk in client.completions.create(
-            model="lula-test", prompt=prompt, max_tokens=16, temperature=0.0, stream=True,
+            model="lily-test", prompt=prompt, max_tokens=16, temperature=0.0, stream=True,
         )
     )
     assert streamed == non_stream
 
     messages = [{"role": "user", "content": "Say hello."}]
     non_stream = client.chat.completions.create(
-        model="lula-test", messages=messages, max_tokens=16, temperature=0.0,
+        model="lily-test", messages=messages, max_tokens=16, temperature=0.0,
     ).choices[0].message.content
     streamed = "".join(
         chunk.choices[0].delta.content or ""
         for chunk in client.chat.completions.create(
-            model="lula-test", messages=messages, max_tokens=16, temperature=0.0, stream=True,
+            model="lily-test", messages=messages, max_tokens=16, temperature=0.0, stream=True,
         )
     )
     assert streamed == non_stream

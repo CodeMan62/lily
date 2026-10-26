@@ -1,8 +1,8 @@
-"""Ask the lula server a single question and print the answer.
+"""Ask the lily server a single question and print the answer.
 
 Start the server first:
 
-    uv run lula-serve --model-path Qwen/Qwen3-0.6B --dtype bfloat16
+    uv run lily-serve --model-path Qwen/Qwen3-0.6B --dtype bfloat16
 
 Then:
 
@@ -18,7 +18,7 @@ import openai
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser("lula ask example")
+    parser = argparse.ArgumentParser("lily ask example")
     parser.add_argument("question", nargs="?", help="the question to ask")
     parser.add_argument("--base-url", default="http://127.0.0.1:30000/v1")
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B", help="served model name")

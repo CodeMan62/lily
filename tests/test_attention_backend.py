@@ -5,12 +5,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from lula.layers.attention.torch_native_backend import TorchNativeAttnBackend
-from lula.layers.attention.triton_backend import TritonAttnBackend
-from lula.layers.radix_attention import RadixAttention
-from lula.mem_cache.allocator import TokenToKVPoolAllocator
-from lula.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
-from lula.model_executor.forward_batch_info import ForwardBatch
+from lily.layers.attention.torch_native_backend import TorchNativeAttnBackend
+from lily.layers.attention.triton_backend import TritonAttnBackend
+from lily.layers.radix_attention import RadixAttention
+from lily.mem_cache.allocator import TokenToKVPoolAllocator
+from lily.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
+from lily.model_executor.forward_batch_info import ForwardBatch
 
 DEVICE = "cuda"
 POOL = 4096

@@ -1,8 +1,8 @@
 import pytest
 import torch
 
-from lula.models.model_config import ModelConfig
-from lula.server_args import ServerArgs
+from lily.models.model_config import ModelConfig
+from lily.server_args import ServerArgs
 from tests.models import SMALL_LLAMA, SMALL_QWEN3
 
 
