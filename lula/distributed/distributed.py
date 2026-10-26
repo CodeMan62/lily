@@ -68,7 +68,7 @@ def tensor_model_parallel_all_gather(x: torch.Tensor, dim: int = -1) -> torch.Te
     dim = dim % x.dim()
     x = x.contiguous()
     out = torch.empty((_TP_SIZE,) + tuple(x.shape), dtype=x.dtype, device=x.device)
-    dist.all_gather_into_tensor(out, x, group=_DEVICE_GROUP)
+    dist.all_gather_single(out, x, group=_DEVICE_GROUP)
     # [tp, ..., d, ...] -> [..., tp * d, ...]
     out = out.movedim(0, dim)
     return out.reshape(x.shape[:dim] + (_TP_SIZE * x.shape[dim],) + x.shape[dim + 1:])
