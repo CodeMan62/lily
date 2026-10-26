@@ -40,24 +40,37 @@ model, max_tokens = os.environ["MODEL"], int(os.environ["MAX_TOKENS"])
 client = openai.AsyncClient(base_url=f"http://127.0.0.1:{os.environ['PORT']}/v1", api_key="none")
 
 async def one(i):
-    r = await client.completions.create(
+    t0 = time.perf_counter()
+    stream = await client.completions.create(
         model=model, prompt=f"Write a long story about robot number {i}.",
-        max_tokens=max_tokens, temperature=0.0, extra_body={"ignore_eos": True})
-    return r.usage.completion_tokens
+        max_tokens=max_tokens, temperature=0.0, stream=True,
+        extra_body={"ignore_eos": True})
+    ttft = None
+    toks = 0
+    async for chunk in stream:
+        if chunk.choices and chunk.choices[0].text:
+            if ttft is None:
+                ttft = time.perf_counter() - t0
+            toks += 1
+    return ttft, toks
 
 async def run(n):
     t = time.perf_counter()
-    toks = sum(await asyncio.gather(*(one(i) for i in range(n))))
-    return toks, time.perf_counter() - t
+    results = await asyncio.gather(*(one(i) for i in range(n)))
+    ttfts = [ttft for ttft, _ in results if ttft is not None]
+    toks = sum(toks for _, toks in results)
+    p99 = sorted(ttfts)[int(0.99 * (len(ttfts) - 1))] if ttfts else 0.0
+    return toks, time.perf_counter() - t, sum(ttfts) / len(ttfts) if ttfts else 0.0, p99
 
 async def main():
     await asyncio.wait_for(run(1), timeout=300)  # warmup
     print(f"\n{model}  ({max_tokens} output tokens/request)\n")
-    print("| concurrency | total tok/s | tok/s per request | time (s) |")
-    print("|---|---|---|---|")
+    print("| concurrency | total tok/s | tok/s per request | ttft avg (ms) | ttft p99 (ms) | time (s) |")
+    print("|---|---|---|---|---|---|")
     for n in (1, 8, 32, 64):
-        toks, dt = await asyncio.wait_for(run(n), timeout=600)
-        print(f"| {n} | {toks / dt:.1f} | {toks / dt / n:.1f} | {dt:.2f} |", flush=True)
+        toks, dt, ttft_avg, ttft_p99 = await asyncio.wait_for(run(n), timeout=600)
+        print(f"| {n} | {toks / dt:.1f} | {toks / dt / n:.1f} | "
+              f"{ttft_avg * 1000:.1f} | {ttft_p99 * 1000:.1f} | {dt:.2f} |", flush=True)
 
 asyncio.run(main())
 EOF
