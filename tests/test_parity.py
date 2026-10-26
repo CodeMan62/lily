@@ -9,7 +9,7 @@ import pytest
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from lula.engine import Engine
+from lula.engine import Engine, EngineConfig
 from tests.models import SMALL_LLAMA, SMALL_QWEN3
 from tests.util import free_cuda
 
@@ -53,7 +53,7 @@ def test_fp32_parity_and_greedy(model_path, backend):
 
     ref_logits, ref_gen = hf_reference(model_path, torch.float32, prompt_ids, N_GEN)
 
-    eng = Engine(model_path, dtype="float32", attention_backend=backend, context_length=1024, max_running_requests=1, max_total_tokens=2048)
+    eng = Engine(EngineConfig(model_path, dtype="float32", attention_backend=backend, context_length=1024, max_running_requests=1, max_total_tokens=2048))
     ours_logits = eng.all_prefill_logits(prompt_ids).cpu()
     torch.testing.assert_close(ours_logits, ref_logits, atol=1e-2, rtol=1e-3)
 
@@ -72,7 +72,7 @@ def test_bf16_argmax_agreement(model_path, backend):
     prompt_ids = tok.encode(PROMPT)[:N_PROMPT]
     ref_logits, _ = hf_reference(model_path, torch.bfloat16, prompt_ids, 0)
 
-    eng = Engine(model_path, dtype="bfloat16", attention_backend=backend, context_length=1024, max_running_requests=1, max_total_tokens=2048)
+    eng = Engine(EngineConfig(model_path, dtype="bfloat16", attention_backend=backend, context_length=1024, max_running_requests=1, max_total_tokens=2048))
     ours_logits = eng.all_prefill_logits(prompt_ids).cpu()
     agree = (ours_logits.argmax(-1) == ref_logits.argmax(-1)).float().mean().item()
     max_diff = (ours_logits - ref_logits).abs().max().item()
