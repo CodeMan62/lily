@@ -54,6 +54,7 @@ class KVCache(abc.ABC):
     page_size: int
     dtype: torch.dtype
     layer_num: int
+    mamba_pool: Optional["MambaStatePool"] = None
 
     @abc.abstractmethod
     def get_key_buffer(self, layer_id: int) -> torch.Tensor: ...
@@ -95,7 +96,7 @@ class MHATokenToKVPool(KVCache):
         self.store_dtype = dtype if dtype != torch.float8_e5m2 else torch.uint8
 
         self.k_buffer = [
-            torch.zeros((size + page_size, head_num, head_dim), dtype=self.store_dtype, device=device)
+            torch.zeros((size + page_size, head_num, self.head_dim), dtype=self.store_dtype, device=device)
             for _ in range(layer_num)
         ]
         self.v_buffer = [
@@ -118,16 +119,139 @@ class MHATokenToKVPool(KVCache):
         itemsize = torch.empty((), dtype=dtype).element_size()
         return head_num * (head_dim + (v_head_dim or head_dim)) * layer_num * itemsize
 
+    def _layer_index(self, layer_id: int) -> int:
+        return layer_id - self.start_layer
+
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
-        return self.k_buffer[layer_id - self.start_layer]
+        return self.k_buffer[self._layer_index(layer_id)]
 
     def get_value_buffer(self, layer_id: int) -> torch.Tensor:
-        return self.v_buffer[layer_id - self.start_layer]
+        return self.v_buffer[self._layer_index(layer_id)]
 
     def set_kv_buffer(self, layer_id: int, loc: torch.Tensor, cache_k: torch.Tensor, cache_v: torch.Tensor) -> None:
-        L = layer_id - self.start_layer
+        L = self._layer_index(layer_id)
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
         self.k_buffer[L][loc] = cache_k.view(-1, self.head_num, self.head_dim)
         self.v_buffer[L][loc] = cache_v.view(-1, self.head_num, self.v_head_dim)
+
+
+class HybridTokenToKVPool(MHATokenToKVPool):
+    """KV pool for hybrid linear-attention models: only the `full_attention`
+    layers own KV buffers, addressed by their global layer id."""
+
+    def __init__(self, full_attention_layer_ids: List[int], **kw):
+        self.layer_ids = list(full_attention_layer_ids)
+        self.layer_index_map = {g: i for i, g in enumerate(self.layer_ids)}
+        kv_kwargs = dict(kw)
+        super().__init__(layer_num=len(self.layer_ids), **kv_kwargs)
+        logger.info(
+            "hybrid KV cache: %d full-attention layers (ids %d..%d), %.2f GB",
+            len(self.layer_ids), self.layer_ids[0], self.layer_ids[-1],
+            self.get_kv_size_bytes() / (1 << 30),
+        )
+
+    def _layer_index(self, layer_id: int) -> int:
+        try:
+            return self.layer_index_map[layer_id]
+        except KeyError:
+            raise KeyError(f"layer {layer_id} is not a full-attention layer ({self.layer_ids})")
+
+
+class MambaStatePool:
+    """Per-request linear-attention states for hybrid models.
+
+    One slot per ReqToTokenPool slot (states[a] lives for the request holding
+    req_pool_idx == a). Slot 0 is reserved as the all-zero state, so a fresh
+    request with a zeroed slot starts from zero without extra init work.
+
+    conv_states[L] stores the last `kernel_size` mixed-qkv tokens (H * W),
+    recurrent_states[L] : [size, num_v_heads, k_head_dim, v_head_dim]
+    """
+
+    def __init__(self, size: int, num_layers: int, conv_dim: int, kernel_size: int,
+                 num_v_heads: int, k_head_dim: int, v_head_dim: int,
+                 dtype: torch.dtype, device: torch.device | str):
+        self.size = size
+        self.num_layers = num_layers
+        self.kernel_size = kernel_size
+        self.device = device
+        self.dtype = dtype
+        self.conv_states = [
+            torch.zeros((size, conv_dim, kernel_size), dtype=dtype, device=device)
+            for _ in range(num_layers)
+        ]
+        self.recurrent_states = [
+            torch.zeros((size, num_v_heads, k_head_dim, v_head_dim), dtype=dtype, device=device)
+            for _ in range(num_layers)
+        ]
+        gb = self.get_size_bytes() / (1 << 30)
+        logger.info(
+            "mamba state pool: %d slots x %d linear-attention layers, %.2f GB",
+            size, num_layers, gb,
+        )
+
+    def get_size_bytes(self) -> int:
+        conv = sum(b.numel() * b.element_size() for b in self.conv_states)
+        rec = sum(b.numel() * b.element_size() for b in self.recurrent_states)
+        return conv + rec
+
+    def slots(self, loc: torch.Tensor) -> torch.Tensor:
+        """Mamba-slot indices for request-row indices (1:1 mapping)."""
+        return loc
+
+    def zero_slots(self, loc: torch.Tensor) -> None:
+        """Reset conv + recurrent states of the given slots (fresh prefill)."""
+        idx = loc.to(self.device).long()
+        for L in range(self.num_layers):
+            self.conv_states[L][idx] = 0
+            self.recurrent_states[L][idx] = 0
+
+    def reset(self) -> None:
+        self.zero_slots(torch.arange(self.size, device=self.device))
+
+    @classmethod
+    def for_model_config(cls, cfg, size: int, device: torch.device | str, dtype: Optional[torch.dtype] = None):
+        """Build a pool sized for this model (linear-attention layers, per rank)."""
+        from lily.distributed import get_tp_info
+
+        info = get_tp_info()
+        k_heads = cfg.get_linear_key_heads(info.tp_size)
+        v_heads = cfg.get_linear_value_heads(info.tp_size)
+        hd, vd = cfg.linear_key_head_dim, cfg.linear_value_head_dim
+        conv_dim = 2 * k_heads * hd + v_heads * vd
+        num_layers = len(cfg.linear_attention_layer_ids)
+        return cls(
+            size=size,
+            num_layers=num_layers,
+            conv_dim=conv_dim,
+            kernel_size=cfg.linear_conv_kernel_size or 4,
+            num_v_heads=v_heads,
+            k_head_dim=hd,
+            v_head_dim=vd,
+            dtype=dtype or cfg.mamba_state_dtype,
+            device=device,
+        )
+
+    def per_slot_bytes(self) -> int:
+        conv = self.conv_states[0].numel() * self.conv_states[0].element_size() if self.conv_states else 0
+        rec = self.recurrent_states[0].numel() * self.recurrent_states[0].element_size() if self.recurrent_states else 0
+        return (conv + rec) * self.num_layers
+
+    @classmethod
+    def per_slot_bytes_for_model_config(cls, cfg) -> int:
+        """Bytes per request slot without allocating the pool."""
+        from lily.distributed import get_tp_info
+
+        info = get_tp_info()
+        k_heads = cfg.get_linear_key_heads(info.tp_size)
+        v_heads = cfg.get_linear_value_heads(info.tp_size)
+        hd, vd = cfg.linear_key_head_dim, cfg.linear_value_head_dim
+        conv_dim = 2 * k_heads * hd + v_heads * vd
+        kernel_size = cfg.linear_conv_kernel_size or 4
+        num_layers = len(cfg.linear_attention_layer_ids)
+        itemsize = cfg.mamba_state_dtype.itemsize
+        conv = conv_dim * kernel_size * itemsize
+        rec = v_heads * hd * vd * itemsize
+        return (conv + rec) * num_layers

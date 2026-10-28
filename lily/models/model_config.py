@@ -55,6 +55,12 @@ class ModelConfig:
     attention_bias: bool
     layer_types: Optional[List[str]]  # e.g. ["linear_attention", ..., "full_attention"]
     quantization_config: Optional[Dict[str, Any]]
+    linear_num_key_heads: int = 0
+    linear_num_value_heads: int = 0
+    linear_key_head_dim: int = 0
+    linear_value_head_dim: int = 0
+    linear_conv_kernel_size: int = 4
+    mamba_ssm_dtype: Optional[str] = None
     eos_token_ids: List[int] = field(default_factory=list)
     bos_token_id: Optional[int] = None
     generation_config: Dict[str, Any] = field(default_factory=dict)
@@ -136,6 +142,12 @@ class ModelConfig:
             attention_bias=bool(text.get("attention_bias", False)),
             layer_types=text.get("layer_types"),
             quantization_config=hf_config.get("quantization_config") or text.get("quantization_config"),
+            linear_num_key_heads=text.get("linear_num_key_heads", 0),
+            linear_num_value_heads=text.get("linear_num_value_heads", 0),
+            linear_key_head_dim=text.get("linear_key_head_dim", 0),
+            linear_value_head_dim=text.get("linear_value_head_dim", 0),
+            linear_conv_kernel_size=text.get("linear_conv_kernel_dim", 4),
+            mamba_ssm_dtype=text.get("mamba_ssm_dtype"),
             eos_token_ids=eos_ids,
             bos_token_id=text.get("bos_token_id"),
             generation_config=generation_config,
@@ -157,12 +169,28 @@ class ModelConfig:
             return list(range(self.num_hidden_layers))
         return [i for i, t in enumerate(self.layer_types) if t == "full_attention"]
 
+    @property
+    def linear_attention_layer_ids(self) -> List[int]:
+        if not self.layer_types:
+            return []
+        return [i for i, t in enumerate(self.layer_types) if t == "linear_attention"]
+
     def get_num_attention_heads(self, tp_size: int) -> int:
         return self.num_attention_heads // tp_size
 
     def get_num_kv_heads(self, tp_size: int) -> int:
         # With fewer KV heads than TP ranks, each rank holds one replicated head.
         return max(1, self.num_key_value_heads // tp_size)
+
+    def get_linear_key_heads(self, tp_size: int) -> int:
+        return self.linear_num_key_heads // tp_size
+
+    def get_linear_value_heads(self, tp_size: int) -> int:
+        return self.linear_num_value_heads // tp_size
+
+    @property
+    def mamba_state_dtype(self) -> torch.dtype:
+        return torch.float32 if (self.mamba_ssm_dtype or "float32") == "float32" else torch.bfloat16
 
     def summary(self) -> str:
         return (

@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 from lily.distributed import DEFAULT_DIST_INIT_ADDR
+from lily.layers.quantization import SUPPORTED_QUANTIZATION
 
 
 @dataclass
@@ -25,7 +26,7 @@ class ServerArgs:
 
     # Backends / quantization
     attention_backend: str = "triton"  # triton | torch_native
-    quantization: Optional[str] = None  # fp8 | awq | gptq | w4a16 | w8a16
+    quantization: Optional[str] = None  # fp8 | w8a16 | w4a16 (weight-only, online at load time)
     kv_cache_dtype: str = "auto"  # auto | fp8_e4m3
 
     # Memory
@@ -117,6 +118,8 @@ class ServerArgs:
             raise ValueError("tp_size must be >= 1")
         if self.dtype not in ("auto", "bfloat16", "float16", "float32"):
             raise ValueError(f"Unknown dtype {self.dtype!r}")
+        if self.quantization is not None and self.quantization not in SUPPORTED_QUANTIZATION:
+            raise ValueError(f"Unknown quantization {self.quantization!r}; supported: {', '.join(SUPPORTED_QUANTIZATION)}")
 
     # ---- CLI binding -------------------------------------------------------
 

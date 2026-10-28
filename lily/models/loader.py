@@ -15,6 +15,7 @@ from torch import nn
 
 from lily.distributed import get_tp_info
 from lily.models.model_config import ModelConfig
+from lily.layers.quantization.base import QuantizationConfig
 from lily.models.registry import ModelRegistry
 from lily.utils import ceil_div, set_default_torch_dtype
 
@@ -32,9 +33,14 @@ def _safetensors_files(model_dir: str) -> List[str]:
     return files
 
 # Checkpoint names whose tensors are split across TP ranks; everything else is replicated.
-_ROW_PARALLEL = ("o_proj.weight", "down_proj.weight")  # split dim 1 (input features)
-_COLUMN_PARALLEL = ("q_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "embed_tokens", "lm_head")  # split dim 0
+_ROW_PARALLEL = ("o_proj.weight", "down_proj.weight", "out_proj.weight")  # split dim 1 (input features)
+_COLUMN_PARALLEL = ("q_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "embed_tokens", "lm_head",
+                    "in_proj_z", "in_proj_b", "in_proj_a", "A_log", "dt_bias")  # split dim 0
 _KV_PROJ = ("k_proj", "v_proj")
+
+# Pre-quantized checkpoints store several tensors per layer (nvfp4), each packed
+# along the K dim; a K-dim slice must be scaled by the packing factor.
+_K_PACK_FACTORS = {"weight_packed": 2, "weight_scale": 16}
 
 
 def read_tp_shard(sf, name: str, num_kv_heads: int) -> torch.Tensor:
@@ -43,8 +49,10 @@ def read_tp_shard(sf, name: str, num_kv_heads: int) -> torch.Tensor:
         return sf.get_tensor(name)
     if any(key in name for key in _ROW_PARALLEL):
         dim = 1
+        pack = next((f for suffix, f in _K_PACK_FACTORS.items() if name.endswith(suffix)), 1)
     elif any(key in name for key in _COLUMN_PARALLEL):
         dim = 0
+        pack = 1
     else:
         return sf.get_tensor(name)
     num_parts = min(tp_size, num_kv_heads) if any(key in name for key in _KV_PROJ) else tp_size
@@ -52,8 +60,9 @@ def read_tp_shard(sf, name: str, num_kv_heads: int) -> torch.Tensor:
     tensor = sf.get_slice(name)
     length = tensor.get_shape()[dim]
     part_size = ceil_div(length, num_parts)
-    rows = slice(part * part_size, min((part + 1) * part_size, length))
-    return tensor[rows] if dim == 0 else tensor[:, rows]
+    rows = slice(part * part_size * pack, min((part + 1) * part_size * pack, length))
+    return tensor[slice(None) if dim == 0 else slice(None), rows] if pack != 1 else (
+        tensor[rows] if dim == 0 else tensor[:, rows])
 
 
 def safetensors_weights_iterator(model_dir: str, num_kv_heads: int) -> Iterator[Tuple[str, torch.Tensor]]:
@@ -68,12 +77,13 @@ def get_model(
     device: torch.device | str = "cuda",
     dtype: Optional[torch.dtype] = None,
     strict: bool = True,
+    quant_config: Optional[QuantizationConfig] = None,
 ) -> nn.Module:
     dtype = dtype or model_config.dtype
     model_cls = ModelRegistry.resolve(model_config.architectures)
     t0 = time.time()
     with set_default_torch_dtype(dtype), torch.device(device):
-        model = model_cls(model_config)
+        model = model_cls(model_config, quant_config=quant_config)
     loaded, unexpected = model.load_weights(
         safetensors_weights_iterator(model_config.model_path, model_config.num_key_value_heads))
     missing = set(dict(model.named_parameters())) - loaded

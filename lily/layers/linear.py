@@ -41,7 +41,9 @@ class LinearBase(nn.Module):
         self.prefix = prefix
         self.quant_method: LinearMethodBase = get_linear_method(quant_config, self, prefix)
         self.quant_method.create_weights(self, input_size, output_size, self.params_dtype)
-        self.weight.weight_loader = self.weight_loader  # type: ignore[attr-defined]
+        for param in self._parameters.values():
+            if getattr(param, "weight_loader", None) is None:
+                param.weight_loader = self.weight_loader  # type: ignore[attr-defined]
         if bias:
             self.bias = nn.Parameter(torch.zeros(output_size, dtype=self.params_dtype), requires_grad=False)
             self.bias.weight_loader = self.weight_loader  # type: ignore[attr-defined]

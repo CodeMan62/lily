@@ -26,6 +26,7 @@ class EngineConfig:
     model_path: str
     dtype: str = "auto"
     attention_backend: str = "triton"
+    quantization: Optional[str] = None
     device: str = "cuda"
     context_length: Optional[int] = None
     max_running_requests: int = 2
@@ -40,6 +41,7 @@ class Engine:
         self.config = config
         self.server_args = ServerArgs(model_path=config.model_path, dtype=config.dtype,
                                       attention_backend=config.attention_backend,
+                                      quantization=config.quantization,
                                       context_length=config.context_length,
                                       max_running_requests=config.max_running_requests,
                                       max_total_tokens=config.max_total_tokens,
