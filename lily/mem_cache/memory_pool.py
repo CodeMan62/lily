@@ -216,9 +216,9 @@ class MambaStatePool:
         """Build a pool sized for this model (linear-attention layers, per rank)."""
         from lily.distributed import get_tp_info
 
-        info = get_tp_info()
-        k_heads = cfg.get_linear_key_heads(info.tp_size)
-        v_heads = cfg.get_linear_value_heads(info.tp_size)
+        tp_size, tp_rank = get_tp_info()
+        k_heads = cfg.get_linear_key_heads(tp_size)
+        v_heads = cfg.get_linear_value_heads(tp_size)
         hd, vd = cfg.linear_key_head_dim, cfg.linear_value_head_dim
         conv_dim = 2 * k_heads * hd + v_heads * vd
         num_layers = len(cfg.linear_attention_layer_ids)
@@ -244,9 +244,9 @@ class MambaStatePool:
         """Bytes per request slot without allocating the pool."""
         from lily.distributed import get_tp_info
 
-        info = get_tp_info()
-        k_heads = cfg.get_linear_key_heads(info.tp_size)
-        v_heads = cfg.get_linear_value_heads(info.tp_size)
+        tp_size, tp_rank = get_tp_info()
+        k_heads = cfg.get_linear_key_heads(tp_size)
+        v_heads = cfg.get_linear_value_heads(tp_size)
         hd, vd = cfg.linear_key_head_dim, cfg.linear_value_head_dim
         conv_dim = 2 * k_heads * hd + v_heads * vd
         kernel_size = cfg.linear_conv_kernel_size or 4

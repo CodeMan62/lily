@@ -111,6 +111,7 @@ class Engine:
     def generate_greedy(self, prompt_ids: List[int], max_new_tokens: int, ignore_eos: bool = True) -> List[int]:
         eos = set(self.model_config.eos_token_ids)
         req_idx = self._new_seq()
+        seq_len = 0
         try:
             logits, seq_len = self._extend(req_idx, 0, prompt_ids)
             logits = logits.next_token_logits[0]

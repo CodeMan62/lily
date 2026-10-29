@@ -35,6 +35,7 @@ from lily.layers.linear import (
     default_weight_loader,
     MergedColumnParallelLinear,
     RowParallelLinear,
+    _broadcast_scalar,
 )
 from lily.layers.quantization.base import QuantizationConfig
 from lily.layers.radix_attention import RadixAttention
@@ -66,6 +67,7 @@ class GateQKVParallelLinear(LinearBase):
         offsets = {"q": 0, "k": self.q_size, "v": self.q_size + self.kv_size}
         sizes = {"q": self.q_size, "k": self.kv_size, "v": self.kv_size}
         off, size = offsets[loaded_shard_id], sizes[loaded_shard_id]
+        loaded_weight = _broadcast_scalar(loaded_weight, size)  # per-tensor quant scalars
         assert loaded_weight.shape[0] == size, (loaded_shard_id, loaded_weight.shape, size)
         param.data.narrow(0, off, size).copy_(loaded_weight)
 
@@ -102,8 +104,8 @@ class Qwen3_5Attention(nn.Module):
         self.o_proj = RowParallelLinear(
             config.num_attention_heads * self.head_dim, self.hidden_size, bias=config.attention_bias,
             quant_config=quant_config, prefix=f"{prefix}.o_proj")
-        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps, zero_centered=True)
+        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps, zero_centered=True)
         self.rotary_emb = get_rope(
             self.head_dim, rotary_dim=config.rotary_dim, max_position=config.context_len,
             base=config.rope_theta, is_neox_style=True)
@@ -114,9 +116,11 @@ class Qwen3_5Attention(nn.Module):
         n = positions.shape[0]
         qkv, _ = self.qkv_proj(hidden_states)
         q2, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q2 = q2.view(n, self.num_heads, self.head_dim, 2)
-        q = self.q_norm(q2[..., 0]).reshape(n, -1)
-        gate = torch.sigmoid(q2[..., 1].reshape(n, -1))
+        # HF layout: per head the q_proj rows are [q (head_dim); gate (head_dim)]
+        # (torch.chunk along the last dim of view(..., head_dim * 2)), not interleaved.
+        q2 = q2.view(n, self.num_heads, 2, self.head_dim)
+        q = self.q_norm(q2[:, :, 0]).reshape(n, -1)
+        gate = torch.sigmoid(q2[:, :, 1].reshape(n, -1))
         k = self.k_norm(k.view(n, self.num_kv_heads, self.head_dim)).reshape(n, -1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
@@ -255,11 +259,11 @@ class GatedDeltaNet(nn.Module):
                     continue
                 prev = None if prefix_lens[i] == 0 else conv_all[slots[i:i + 1]].squeeze(0)
                 mixed, new_state = causal_conv1d_stream(qkv[rows].t(), prev, w, self.conv_kernel_size)
-                conv_all[slots[i:i + 1]] = new_state.unsqueeze(0)
+                conv_all[slots[i:i + 1]] = new_state.unsqueeze(0).to(conv_all.dtype)
                 state = rec_all[slots[i:i + 1]]                      # [1, h, k, v]
                 initial = state[0]
-                output[rows] = self._chunk(mixed, b[rows], a[rows], initial)
-                rec_all[slots[i:i + 1]] = initial.unsqueeze(0)
+                output[rows] = self._chunk(mixed.t(), b[rows], a[rows], initial).to(output.dtype)
+                rec_all[slots[i:i + 1]] = initial.unsqueeze(0).to(rec_all.dtype)
             if decode_rows:
                 idx = torch.tensor(decode_rows, dtype=torch.int64, device=qkv.device)
                 row_slots = slots[idx]
@@ -326,8 +330,8 @@ class Qwen3_5DecoderLayer(nn.Module):
             raise ValueError(f"unknown Qwen3.5 layer type {block_type!r}")
         self.mlp = LlamaMLP(config.hidden_size, config.intermediate_size, config.hidden_act,
                             quant_config=quant_config, prefix=f"{prefix}.mlp")
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, zero_centered=True)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, zero_centered=True)
 
     def forward(self, positions, hidden_states, forward_batch, residual):
         if residual is None:
@@ -352,7 +356,7 @@ class Qwen3_5Model(nn.Module):
             Qwen3_5DecoderLayer(config, i, quant_config=quant_config, prefix=f"{prefix}.layers.{i}")
             for i in range(config.num_hidden_layers)
         ])
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, zero_centered=True)
 
     def forward(self, input_ids, positions, forward_batch, input_embeds: Optional[torch.Tensor] = None) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids) if input_embeds is None else input_embeds
@@ -431,18 +435,33 @@ class Qwen3_5ForCausalLM(LlamaForCausalLMBase):
                 continue
             param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            if ".in_proj_qkv." in name or ".conv1d." in name:
+            # The fused in_proj_qkv tensor is split per rank into q/k/v row
+            # segments. conv1d must NOT go through this path: its loader slices
+            # the full checkpoint tensor per rank itself.
+            if ".in_proj_qkv." in name and ".conv1d." not in name:
                 tp_size, tp_rank = get_tp_info()
-                segs = _rank_segments(
-                    loaded_weight,
-                    self.config.linear_num_key_heads, self.config.linear_num_value_heads,
-                    self.config.linear_key_head_dim, self.config.linear_value_head_dim,
-                    tp_rank, tp_size)
+                if loaded_weight.numel() == 1:
+                    # Per-tensor quant scalar (NVFP4 weight_global_scale): the
+                    # same value applies to every q/k/v row segment.
+                    segs = [loaded_weight] * 3
+                else:
+                    segs = _rank_segments(
+                        loaded_weight,
+                        self.config.linear_num_key_heads, self.config.linear_num_value_heads,
+                        self.config.linear_key_head_dim, self.config.linear_value_head_dim,
+                        tp_rank, tp_size)
                 for sid, partial in enumerate(segs):
                     weight_loader(param, partial, sid)
-            elif shard_id is not None:
-                weight_loader(param, loaded_weight, shard_id)
             else:
-                weight_loader(param, loaded_weight)
+                try:
+                    if shard_id is not None:
+                        weight_loader(param, loaded_weight, shard_id)
+                    else:
+                        weight_loader(param, loaded_weight)
+                except (AssertionError, RuntimeError) as e:
+                    raise RuntimeError(
+                        f"failed loading checkpoint tensor {name!r} shape={tuple(loaded_weight.shape)} "
+                        f"dtype={loaded_weight.dtype} into param shape={tuple(param.shape)} "
+                        f"shard={shard_id!r}: {e}") from e
             loaded.add(name)
         return loaded, unexpected

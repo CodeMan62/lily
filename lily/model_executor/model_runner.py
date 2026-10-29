@@ -121,12 +121,12 @@ class ModelRunner:
         full_layer_ids = cfg.full_attention_layer_ids
         if cfg.is_hybrid:
             self.token_to_kv_pool = HybridTokenToKVPool(
-                self.max_total_num_tokens,
+                full_layer_ids,
+                size=self.max_total_num_tokens,
                 page_size=1,
                 dtype=self.kv_cache_dtype,
                 head_num=self.num_kv_heads,
                 head_dim=cfg.head_dim,
-                full_attention_layer_ids=full_layer_ids,
                 device=self.device,
             )
             # Mamba states are allocated per request slot, independent of tokens.

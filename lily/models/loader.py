@@ -38,18 +38,21 @@ _COLUMN_PARALLEL = ("q_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "embed
                     "in_proj_z", "in_proj_b", "in_proj_a", "A_log", "dt_bias")  # split dim 0
 _KV_PROJ = ("k_proj", "v_proj")
 
-# Pre-quantized checkpoints store several tensors per layer (nvfp4), each packed
-# along the K dim; a K-dim slice must be scaled by the packing factor.
-_K_PACK_FACTORS = {"weight_packed": 2, "weight_scale": 16}
+# Default packing factors for pre-quantized checkpoints that store extra tensors
+# per layer (uint8-packed NVFP4): a K-dim slice must be scaled by the packing factor.
+_QUANT_FORMAT_FACTORS = {"weight_packed": 2, "weight_scale": 16}
 
 
-def read_tp_shard(sf, name: str, num_kv_heads: int) -> torch.Tensor:
+def read_tp_shard(sf, name: str, num_kv_heads: int, pack_factors: Optional[dict] = None) -> torch.Tensor:
     tp_size, tp_rank = get_tp_info()
     if tp_size == 1:
         return sf.get_tensor(name)
+    if name.endswith("weight_global_scale"):  # per-tensor scalar: replicated on every rank
+        return sf.get_tensor(name)
     if any(key in name for key in _ROW_PARALLEL):
         dim = 1
-        pack = next((f for suffix, f in _K_PACK_FACTORS.items() if name.endswith(suffix)), 1)
+        factors = pack_factors or _QUANT_FORMAT_FACTORS
+        pack = next((f for suffix, f in factors.items() if name.endswith(suffix)), 1)
     elif any(key in name for key in _COLUMN_PARALLEL):
         dim = 0
         pack = 1
@@ -65,12 +68,12 @@ def read_tp_shard(sf, name: str, num_kv_heads: int) -> torch.Tensor:
         tensor[rows] if dim == 0 else tensor[:, rows])
 
 
-def safetensors_weights_iterator(model_dir: str, num_kv_heads: int) -> Iterator[Tuple[str, torch.Tensor]]:
+def safetensors_weights_iterator(model_dir: str, num_kv_heads: int, pack_factors: Optional[dict] = None) -> Iterator[Tuple[str, torch.Tensor]]:
     """Stream (name, tensor) pairs shard by shard, each already cut to this TP rank's slice."""
     for path in _safetensors_files(model_dir):
         with safe_open(path, framework="pt", device="cpu") as sf:
             for name in sf.keys():
-                yield name, read_tp_shard(sf, name, num_kv_heads)
+                yield name, read_tp_shard(sf, name, num_kv_heads, pack_factors)
 
 def get_model(
     model_config: ModelConfig,
@@ -84,8 +87,9 @@ def get_model(
     t0 = time.time()
     with set_default_torch_dtype(dtype), torch.device(device):
         model = model_cls(model_config, quant_config=quant_config)
-    loaded, unexpected = model.load_weights(
-        safetensors_weights_iterator(model_config.model_path, model_config.num_key_value_heads))
+    loaded, unexpected = model.load_weights(safetensors_weights_iterator(
+        model_config.model_path, model_config.num_key_value_heads,
+        pack_factors=getattr(quant_config, "tp_pack_factors", None)))
     missing = set(dict(model.named_parameters())) - loaded
     if unexpected:
         logger.warning("ignored %d unexpected checkpoint tensors, e.g. %s", len(unexpected), sorted(unexpected)[:5])

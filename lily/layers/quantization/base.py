@@ -60,6 +60,21 @@ class QuantizationConfig(ABC):
     def get_quant_method(self, layer: nn.Module, prefix: str) -> Optional[QuantizeMethodBase]: ...
 
 
+def prefix_ignored(prefix: str, patterns) -> bool:
+    """True when `prefix` matches one of the checkpoint's `ignore` patterns.
+
+    Checkpoints name modules like `model.language_model.layers...` while lily's
+    own prefix is `model.layers...` (see Qwen3_5 name remap), so both forms are
+    accepted.
+    """
+    for pattern in patterns:
+        for p in (pattern, pattern.replace("model.language_model.", "model.", 1)):
+            base = p.rstrip(".")
+            if prefix == base or prefix.startswith(base + "."):
+                return True
+    return False
+
+
 def get_linear_method(quant_config: Optional[QuantizationConfig], layer: nn.Module, prefix: str) -> LinearMethodBase:
     if quant_config is None:
         return UnquantizedLinearMethod()

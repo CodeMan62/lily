@@ -18,8 +18,19 @@ from lily.layers.quantization.base import LinearMethodBase, QuantizationConfig, 
 
 
 def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+    if loaded_weight.numel() == 1 and param.numel() != 1:
+        # Per-tensor quant scalar (e.g. NVFP4 weight_global_scale) stored per row.
+        param.data.fill_(loaded_weight.reshape(()).item())
+        return
     assert param.shape == loaded_weight.shape, f"shape mismatch {tuple(param.shape)} vs {tuple(loaded_weight.shape)}"
     param.data.copy_(loaded_weight)
+
+
+def _broadcast_scalar(loaded_weight: torch.Tensor, size: int) -> torch.Tensor:
+    """A checkpoint [1] scalar (per-tensor quant scale) fills every row of its shard."""
+    if loaded_weight.numel() == 1 and size != 1:
+        return loaded_weight.reshape(1).expand(size)
+    return loaded_weight
 
 
 class LinearBase(nn.Module):
@@ -73,7 +84,8 @@ class MergedColumnParallelLinear(LinearBase):
             return
         offset = sum(self.output_sizes[:loaded_shard_id])
         size = self.output_sizes[loaded_shard_id]
-        assert loaded_weight.shape[0] == size, (loaded_weight.shape, size)
+        loaded_weight = _broadcast_scalar(loaded_weight, size)
+        assert loaded_weight.shape[0] == size, (self.prefix, loaded_shard_id, loaded_weight.shape, size)
         param.data.narrow(0, offset, size).copy_(loaded_weight)
 
 
@@ -106,6 +118,7 @@ class QKVParallelLinear(LinearBase):
         offsets = {"q": 0, "k": self.q_size, "v": self.q_size + self.kv_size}
         sizes = {"q": self.q_size, "k": self.kv_size, "v": self.kv_size}
         off, size = offsets[loaded_shard_id], sizes[loaded_shard_id]
+        loaded_weight = _broadcast_scalar(loaded_weight, size)
         assert loaded_weight.shape[0] == size, (loaded_shard_id, loaded_weight.shape, size)
         param.data.narrow(0, off, size).copy_(loaded_weight)
 

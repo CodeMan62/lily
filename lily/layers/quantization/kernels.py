@@ -36,7 +36,8 @@ def _decode_e2m1(nibble):
     m = (a & 0x01).to(tl.float32)
     e = (a >> 1).to(tl.float32)
     val = tl.where(a < 2, m * 0.5, (1.0 + 0.5 * m) * tl.exp2(e - 1.0))
-    return val * tl.where((a & 0x08) != 0, -1.0, 1.0)
+    # sign lives in bit 3 of the *unmasked* nibble
+    return val * tl.where((nibble & 0x08) != 0, -1.0, 1.0)
 
 
 @triton.jit
@@ -51,7 +52,7 @@ def _decode_e4m3(b):
 
 @triton.jit
 def _weight_only_matmul_kernel(x_ptr, w_ptr, scale_ptr, out_ptr,
-                               M, N, K_REAL, K_STORED, SCALE_STRIDE, GLOBAL_SCALE,
+                               M, N, K_REAL, K_STORED, SCALE_STRIDE, GLOBAL_SCALE, GS_STRIDE,
                                FAMILY: tl.constexpr,
                                BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
     pid_m = tl.program_id(0)
@@ -105,8 +106,11 @@ def _weight_only_matmul_kernel(x_ptr, w_ptr, scale_ptr, out_ptr,
         s = tl.load(scale_ptr + offs_n, mask=n_mask, other=1.0)
         acc = acc * s[None, :]
     elif FAMILY == FAMILY_NVFP4:
-        # global_scale is a [1] fp32 tensor read per program (no host sync)
-        acc = acc * tl.load(GLOBAL_SCALE)
+        # global_scale is an fp32 tensor read per program (no host sync): one
+        # value per output row (GS_STRIDE=1) or a single [1] scalar (GS_STRIDE=0).
+        # compressed-tensors convention: dequant = e2m1 * block_scale / global_scale
+        gs = tl.load(GLOBAL_SCALE + offs_n * GS_STRIDE, mask=n_mask, other=1.0)
+        acc = acc / gs[None, :]
 
     out_ptrs = out_ptr + offs_m[:, None] * N + offs_n[None, :]
     tl.store(out_ptrs, acc.to(out_ptr.dtype.element_ty), mask=m_mask[:, None] & n_mask[None, :])
@@ -119,14 +123,23 @@ def weight_only_matmul(x: torch.Tensor, w: torch.Tensor, scale: torch.Tensor,
 
     `family`: FAMILY_INT8 (int8 weight, per-channel scale), FAMILY_INT4 (uint8-packed
     int4, per-group scale, BLOCK_K == group_size), FAMILY_FP8 (e4m3 bytes, per-channel
-    scale), FAMILY_NVFP4 (e2m1 nibbles, e4m3 per-16 scale, fp32 global scale).
-    `global_scale` (NVFP4) is a GPU scalar tensor read inside the kernel.
+    scale), FAMILY_NVFP4 (e2m1 nibbles, e4m3 per-16 scale, divided by fp32 global scale).
+    `global_scale` (NVFP4) is a GPU fp32 tensor read inside the kernel: either
+    a [1] scalar or one value per output row ([N]).
     """
     if x.dtype is not torch.bfloat16 or not x.is_contiguous() or not w.is_contiguous():
         return None
     n, dim1 = w.shape
     if n != scale.shape[0]:
         return None
+    if family == FAMILY_NVFP4:
+        if global_scale is None:
+            global_scale = torch.ones(1, dtype=torch.float32, device=x.device)
+        if global_scale.numel() not in (1, n) or not global_scale.is_contiguous():
+            return None
+        gs_stride = 0 if global_scale.numel() == 1 else 1
+    else:
+        gs_stride = 0
     # packed families (INT4, NVFP4) store K/2 bytes per row: stored column count is 2*dim1
     k_stored = 2 * dim1 if family in (FAMILY_INT4, FAMILY_NVFP4) else dim1
     k_real = x.shape[-1]
@@ -156,7 +169,7 @@ def weight_only_matmul(x: torch.Tensor, w: torch.Tensor, scale: torch.Tensor,
     grid = (triton.cdiv(m, block_m), triton.cdiv(n, block_n))
     _weight_only_matmul_kernel[grid](
         x2, w, scale, out, m, n, x2.shape[1], k_stored,
-        scale.stride(0) if scale.dim() > 1 else 0, global_scale if global_scale is not None else 1.0,
+        scale.stride(0) if scale.dim() > 1 else 0, global_scale if global_scale is not None else 1.0, gs_stride,
         FAMILY=family, BLOCK_M=block_m, BLOCK_N=block_n,
         BLOCK_K=block_k, num_warps=4,
     )

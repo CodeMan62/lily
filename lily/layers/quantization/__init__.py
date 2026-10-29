@@ -11,6 +11,7 @@ from lily.layers.quantization.base import (
     UnquantizedLinearMethod,
     get_linear_method,
 )
+from lily.layers.quantization.compressed_int4 import CompressedInt4Config
 from lily.layers.quantization.nvfp4 import NVFP4Config
 from lily.layers.quantization.weight_only import FP8Config, W4A16Config, W8A16Config
 
@@ -18,14 +19,14 @@ _QUANT_CONFIGS = {
     "fp8": FP8Config,
     "w8a16": W8A16Config,
     "w4a16": W4A16Config,
-    "nvfp4": NVFP4Config,
 }
 SUPPORTED_QUANTIZATION = tuple(_QUANT_CONFIGS)
 
-# Checkpoint-side detection: quant_method -> config class.
+# pre-quantized checkpoint formats: quant_method -> format -> config class
 _CHECKPOINT_METHODS = {
     "compressed-tensors": {
         "nvfp4-pack-quantized": NVFP4Config,
+        "pack-quantized": CompressedInt4Config,
     },
 }
 
@@ -69,4 +70,5 @@ __all__ = [
     "W4A16Config",
     "W8A16Config",
     "NVFP4Config",
+    "CompressedInt4Config",
 ]

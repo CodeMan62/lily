@@ -14,9 +14,12 @@ class RMSNorm(nn.Module):
     Numerics follow HF: the sum is taken in the activation dtype, the variance in fp32.
     """
 
-    def __init__(self, hidden_size: int, eps: float = 1e-6):
+    def __init__(self, hidden_size: int, eps: float = 1e-6, zero_centered: bool = False):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
+        # zero_centered (Qwen3.5 `RMSNormZeroCentered`): out = norm(x) * (1 + weight),
+        # computed in fp32; the checkpoint weight is an offset around zero.
+        self.zero_centered = zero_centered
+        self.weight = nn.Parameter(torch.zeros(hidden_size) if zero_centered else torch.ones(hidden_size))
         self.variance_epsilon = eps
 
     def forward(
@@ -29,7 +32,10 @@ class RMSNorm(nn.Module):
         xf = x.to(torch.float32)
         variance = xf.pow(2).mean(dim=-1, keepdim=True)
         xf = xf * torch.rsqrt(variance + self.variance_epsilon)
-        out = self.weight * xf.to(orig_dtype)
+        if self.zero_centered:
+            out = (xf * (1.0 + self.weight.float())).to(orig_dtype)
+        else:
+            out = self.weight * xf.to(orig_dtype)
         if residual is None:
             return out
         return out, residual

@@ -42,8 +42,12 @@ def causal_conv1d_step(hidden: torch.Tensor, conv_state: torch.Tensor, weight: t
     Updates conv_state in place and returns the silu-activated outputs [N, conv_dim].
     """
     kernel = conv_state.shape[-1]
-    stream = torch.cat([conv_state, hidden.unsqueeze(-1)], dim=-1)  # [N, conv_dim, kernel + 1]
-    out = F.conv1d(stream, weight.unsqueeze(1), padding=0, groups=stream.shape[1])
+    if weight.dim() == 2:  # [conv_dim, kernel] -> grouped conv layout [conv_dim, 1, kernel]
+        weight = weight.unsqueeze(1)
+    # The state pool may be fp32 (mamba_ssm_dtype) while weights are bf16:
+    # compute in the activation dtype, write the state back in the pool dtype.
+    stream = torch.cat([conv_state.to(hidden.dtype), hidden.unsqueeze(-1)], dim=-1)  # [N, conv_dim, kernel + 1]
+    out = F.conv1d(stream, weight.to(hidden.dtype), padding=0, groups=stream.shape[1])
     conv_state.copy_(stream[:, :, -kernel:])
     return F.silu(out[:, :, -1])
 
@@ -59,15 +63,17 @@ def causal_conv1d_stream(
     [conv_dim, kernel])` — the caller writes `new_state` back to the pool.
     """
     L = hidden.shape[-1]
+    if weight.dim() == 2:  # [conv_dim, kernel] -> grouped conv layout [conv_dim, 1, kernel]
+        weight = weight.unsqueeze(1)
     if prev_state is not None:
-        stream = torch.cat([prev_state, hidden], dim=-1)  # [conv_dim, kernel + L]
+        stream = torch.cat([prev_state.to(hidden.dtype), hidden], dim=-1)  # [conv_dim, kernel + L]
         new_state = stream[:, -kernel:]
     else:
         # Fresh prefill: causal_conv1d pads the left with kernel-1 zeros and
         # yields L outputs; the trailing kernel columns are the new state.
         stream = F.pad(hidden, (kernel - 1, 0))
         new_state = stream[:, -kernel:]
-    out = F.conv1d(stream, weight.unsqueeze(1), padding=0, groups=stream.shape[0])
+    out = F.conv1d(stream, weight.to(stream.dtype), padding=0, groups=stream.shape[0])
     out = out[..., -L:]   # continuation yields kernel+L windows; keep the last L
     return F.silu(out), new_state
 

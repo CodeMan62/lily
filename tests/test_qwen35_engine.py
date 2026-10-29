@@ -50,7 +50,7 @@ def test_prefill_logits_match_reference():
     eng = Engine(EngineConfig(str(CHECK.path), dtype="bfloat16", max_total_tokens=1024,
                               max_running_requests=1))
     try:
-        got = eng.all_prefill_logits(IDS).float()
+        got = eng.all_prefill_logits(IDS).float().cpu()
     finally:
         del eng
 
@@ -91,7 +91,7 @@ def test_chunked_prefill_continuation_matches():
         req = eng._new_seq()
         eng._extend(req, 0, IDS[:split])
         logits, _ = eng._extend(req, split, IDS[split:])
-        tail = logits.next_token_logits[0].float()
+        tail = logits.next_token_logits[0].float().cpu()
     finally:
         del eng
 
@@ -99,7 +99,7 @@ def test_chunked_prefill_continuation_matches():
     eng = Engine(EngineConfig(str(CHECK.path), dtype="bfloat16", max_total_tokens=1024,
                               max_running_requests=1))
     try:
-        full = eng.prefill_logits(IDS).float()
+        full = eng.prefill_logits(IDS).float().cpu()
     finally:
         del eng
 
