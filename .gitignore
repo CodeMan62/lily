@@ -6,3 +6,5 @@ __pycache__/
 bench/*.json
 TODO.md
 ROADMAP.md
+bench/results
+bench/logs/
