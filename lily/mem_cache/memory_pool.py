@@ -211,22 +211,27 @@ class MambaStatePool:
     def reset(self) -> None:
         self.zero_slots(torch.arange(self.size, device=self.device))
 
-    @classmethod
-    def for_model_config(cls, cfg, size: int, device: torch.device | str, dtype: Optional[torch.dtype] = None):
-        """Build a pool sized for this model (linear-attention layers, per rank)."""
+    @staticmethod
+    def _dims_for_model_config(cfg):
+        """(v_heads, k_head_dim, v_head_dim, conv_dim, kernel_size, num_layers) per rank."""
         from lily.distributed import get_tp_info
 
-        tp_size, tp_rank = get_tp_info()
+        tp_size, _ = get_tp_info()
         k_heads = cfg.get_linear_key_heads(tp_size)
         v_heads = cfg.get_linear_value_heads(tp_size)
         hd, vd = cfg.linear_key_head_dim, cfg.linear_value_head_dim
         conv_dim = 2 * k_heads * hd + v_heads * vd
-        num_layers = len(cfg.linear_attention_layer_ids)
+        return v_heads, hd, vd, conv_dim, cfg.linear_conv_kernel_size or 4, len(cfg.linear_attention_layer_ids)
+
+    @classmethod
+    def for_model_config(cls, cfg, size: int, device: torch.device | str, dtype: Optional[torch.dtype] = None):
+        """Build a pool sized for this model (linear-attention layers, per rank)."""
+        v_heads, hd, vd, conv_dim, kernel_size, num_layers = cls._dims_for_model_config(cfg)
         return cls(
             size=size,
             num_layers=num_layers,
             conv_dim=conv_dim,
-            kernel_size=cfg.linear_conv_kernel_size or 4,
+            kernel_size=kernel_size,
             num_v_heads=v_heads,
             k_head_dim=hd,
             v_head_dim=vd,
@@ -242,15 +247,7 @@ class MambaStatePool:
     @classmethod
     def per_slot_bytes_for_model_config(cls, cfg) -> int:
         """Bytes per request slot without allocating the pool."""
-        from lily.distributed import get_tp_info
-
-        tp_size, tp_rank = get_tp_info()
-        k_heads = cfg.get_linear_key_heads(tp_size)
-        v_heads = cfg.get_linear_value_heads(tp_size)
-        hd, vd = cfg.linear_key_head_dim, cfg.linear_value_head_dim
-        conv_dim = 2 * k_heads * hd + v_heads * vd
-        kernel_size = cfg.linear_conv_kernel_size or 4
-        num_layers = len(cfg.linear_attention_layer_ids)
+        v_heads, hd, vd, conv_dim, kernel_size, num_layers = cls._dims_for_model_config(cfg)
         itemsize = cfg.mamba_state_dtype.itemsize
         conv = conv_dim * kernel_size * itemsize
         rec = v_heads * hd * vd * itemsize

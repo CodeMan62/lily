@@ -538,41 +538,42 @@ class Scheduler:
         else:
             running.append(req)
 
-    def _emit(self, req: Req, token: int) -> None:
-        out = SchedulerOutput(
-            rid=req.rid,
-            output_ids=list(req.output_ids),
-            new_token_ids=[token],
-            finished=False,
-            logprobs=[req.output_logprobs[-1]] if req.output_logprobs else None,
-            prompt_tokens=len(req.origin_input_ids),
-            completion_tokens=len(req.output_ids),
-            stop_strs=list(req.sampling_params.stop or []),
-        )
+    def _publish(self, req: Req, out: SchedulerOutput) -> None:
         item = self._requests.get(req.rid)
         if item is not None:
             item.result = out
+            if out.finished and item.finish_event is not None:
+                item.finish_event.set()
         self.output_queue.put(out)
 
-    def _finish(self, req: Req) -> None:
-        out = SchedulerOutput(
+    def _output(self, req: Req, **kwargs) -> SchedulerOutput:
+        return SchedulerOutput(
             rid=req.rid,
             output_ids=list(req.output_ids),
+            prompt_tokens=len(req.origin_input_ids),
+            completion_tokens=len(req.output_ids),
+            stop_strs=list(req.sampling_params.stop or []),
+            **kwargs,
+        )
+
+    def _emit(self, req: Req, token: int) -> None:
+        out = self._output(
+            req,
+            new_token_ids=[token],
+            logprobs=[req.output_logprobs[-1]] if req.output_logprobs else None,
+        )
+        self._publish(req, out)
+
+    def _finish(self, req: Req) -> None:
+        out = self._output(
+            req,
             new_token_ids=[],
             finished=True,
             finish_reason=req.finished_reason,
             logprobs=list(req.output_logprobs) if req.output_logprobs else None,
             top_logprobs=list(req.top_logprobs) if req.top_logprobs else None,
-            prompt_tokens=len(req.origin_input_ids),
-            completion_tokens=len(req.output_ids),
-            stop_strs=list(req.sampling_params.stop or []),
         )
-        item = self._requests.get(req.rid)
-        if item is not None:
-            item.result = out
-            if item.finish_event is not None:
-                item.finish_event.set()
-        self.output_queue.put(out)
+        self._publish(req, out)
 
     # ---- loops -------------------------------------------------------------
 

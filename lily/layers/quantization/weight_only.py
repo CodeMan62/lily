@@ -21,7 +21,12 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from lily.layers.quantization.base import LinearMethodBase, QuantizationConfig
+from lily.layers.quantization.base import (
+    LinearMethodBase,
+    PackedWeightLinearMethod,
+    QuantizationConfig,
+    unpack_int4_weight,
+)
 from lily.layers.quantization.kernels import FAMILY_FP8, FAMILY_INT4, FAMILY_INT8, weight_only_matmul
 
 FP8_MAX = 448.0  # float8_e4m3fn range
@@ -34,25 +39,40 @@ def _replace_weight(layer: nn.Module, data: torch.Tensor) -> None:
     layer.register_parameter("weight", nn.Parameter(data, requires_grad=False))
 
 
-class WeightOnlyLinearMethod(LinearMethodBase):
+class WeightOnlyLinearMethod(PackedWeightLinearMethod):
     """Common scaffold: plain fp weights at load, converted after loading."""
 
     def create_weights(self, layer, input_size, output_size, params_dtype):
         weight = nn.Parameter(torch.empty(output_size, input_size, dtype=params_dtype), requires_grad=False)
         layer.register_parameter("weight", weight)
 
+    def _matmul(self, layer, x):
+        return None  # this family only has the torch dequant path
+
+
+class _PerChannelLinearMethod(WeightOnlyLinearMethod):
+    """int8/fp8 weight + one fp32 scale per output channel. `y = (x @ Wq^T) * scale`."""
+
+    family: Any
+
+    def _kernel_weight(self, layer) -> torch.Tensor:
+        return layer.weight.data
+
     def apply(self, layer, x, bias=None):
-        out = F.linear(x, self.dequantized_weight(layer))
+        out = weight_only_matmul(x, self._kernel_weight(layer), layer.weight_scale.data, self.family)
+        if out is None:
+            out = F.linear(x, layer.weight.to(x.dtype))
+            out.mul_(layer.weight_scale.to(out.dtype))
         if bias is not None:
             out.add_(bias)
         return out
 
-    def dequantized_weight(self, layer) -> torch.Tensor:  # pragma: no cover
-        raise NotImplementedError
+    def dequantized_weight(self, layer):  # pragma: no cover
+        return layer.weight.to(torch.float32) * layer.weight_scale.unsqueeze(1)
 
 
-class W8A16LinearMethod(WeightOnlyLinearMethod):
-    """int8 + per-channel scale. `y = (x @ Wq^T) * scale`."""
+class W8A16LinearMethod(_PerChannelLinearMethod):
+    family = FAMILY_INT8
 
     def process_weights_after_loading(self, layer):
         with torch.no_grad():
@@ -62,21 +82,15 @@ class W8A16LinearMethod(WeightOnlyLinearMethod):
             _replace_weight(layer, q)
             layer.weight_scale = nn.Parameter(scale, requires_grad=False)
 
-    def apply(self, layer, x, bias=None):
-        out = weight_only_matmul(x, layer.weight.data, layer.weight_scale.data, FAMILY_INT8)
-        if out is None:
-            out = F.linear(x, layer.weight.to(x.dtype))
-            out.mul_(layer.weight_scale.to(out.dtype))
-        if bias is not None:
-            out.add_(bias)
-        return out
 
-    def dequantized_weight(self, layer):  # pragma: no cover
-        return layer.weight.to(torch.float32) * layer.weight_scale.unsqueeze(1)
-
-
-class FP8LinearMethod(WeightOnlyLinearMethod):
+class FP8LinearMethod(_PerChannelLinearMethod):
     """float8_e4m3fn + per-channel scale, same math as W8A16."""
+
+    family = FAMILY_FP8
+
+    def _kernel_weight(self, layer) -> torch.Tensor:
+        # byte view: the kernel decodes e4m3 manually (fp8 dtype pointers are sm89+)
+        return layer.weight.data.view(torch.uint8)
 
     def process_weights_after_loading(self, layer):
         with torch.no_grad():
@@ -85,19 +99,6 @@ class FP8LinearMethod(WeightOnlyLinearMethod):
             q = (w / scale.unsqueeze(1)).to(torch.float8_e4m3fn)
             _replace_weight(layer, q)
             layer.weight_scale = nn.Parameter(scale, requires_grad=False)
-
-    def apply(self, layer, x, bias=None):
-        # byte view: the kernel decodes e4m3 manually (fp8 dtype pointers are sm89+
-        out = weight_only_matmul(x, layer.weight.data.view(torch.uint8), layer.weight_scale.data, FAMILY_FP8)
-        if out is None:
-            out = F.linear(x, layer.weight.to(x.dtype))
-            out.mul_(layer.weight_scale.to(out.dtype))
-        if bias is not None:
-            out.add_(bias)
-        return out
-
-    def dequantized_weight(self, layer):  # pragma: no cover
-        return layer.weight.to(torch.float32) * layer.weight_scale.unsqueeze(1)
 
 
 class W4A16LinearMethod(WeightOnlyLinearMethod):
@@ -123,48 +124,41 @@ class W4A16LinearMethod(WeightOnlyLinearMethod):
             layer.weight_scale = nn.Parameter(scale.squeeze(-1).float(), requires_grad=False)  # [N, K/g]
 
     def dequantized_weight(self, layer):
-        packed = layer.weight.data  # [N, K_pad/2] uint8
-        n, k_half = packed.shape
-        # nibble unpack + group rescale, bf16 throughout (fp32 here shows up in decode latency)
-        scale = layer.weight_scale.data.to(torch.bfloat16).repeat_interleave(self.group_size, dim=1)  # [N, K_pad]
-        u = torch.stack(((packed & 0x0F).to(torch.int8), (packed >> 4).to(torch.int8)), dim=-1)
-        w = (u.view(n, -1) - 8).to(torch.bfloat16).mul_(scale)
+        # bf16 throughout (fp32 here shows up in decode latency)
+        w = unpack_int4_weight(layer.weight.data, layer.weight_scale.data, self.group_size)
         return w[:, : layer.input_size]
 
-    def apply(self, layer, x, bias=None):
-        out = weight_only_matmul(x, layer.weight.data, layer.weight_scale.data,
-                                 FAMILY_INT4, self.group_size)
-        if out is None:
-            out = F.linear(x, self.dequantized_weight(layer))
-        if bias is not None:
-            out.add_(bias)
-        return out
+    def _matmul(self, layer, x):
+        return weight_only_matmul(x, layer.weight.data, layer.weight_scale.data,
+                                  FAMILY_INT4, self.group_size)
 
 
-class W8A16Config(QuantizationConfig):
+class _OnlineQuantConfig(QuantizationConfig):
+    """Parameterless online method selected by name."""
+
+    name: str
+    method_cls: type
+
     @classmethod
     def get_name(cls) -> str:
-        return "w8a16"
+        return cls.name
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "W8A16Config":
+    def from_config(cls, config: Dict[str, Any]) -> "_OnlineQuantConfig":
         return cls()
 
     def get_quant_method(self, layer: nn.Module, prefix: str) -> Optional[LinearMethodBase]:
-        return W8A16LinearMethod()
+        return self.method_cls()
 
 
-class FP8Config(QuantizationConfig):
-    @classmethod
-    def get_name(cls) -> str:
-        return "fp8"
+class W8A16Config(_OnlineQuantConfig):
+    name = "w8a16"
+    method_cls = W8A16LinearMethod
 
-    @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "FP8Config":
-        return cls()
 
-    def get_quant_method(self, layer: nn.Module, prefix: str) -> Optional[LinearMethodBase]:
-        return FP8LinearMethod()
+class FP8Config(_OnlineQuantConfig):
+    name = "fp8"
+    method_cls = FP8LinearMethod
 
 
 class W4A16Config(QuantizationConfig):

@@ -42,6 +42,10 @@ class LlamaMLP(nn.Module):
 
 
 class LlamaAttention(nn.Module):
+    qkv_cls: Type[nn.Module] = QKVParallelLinear
+    q_size_multiplier: int = 1
+    use_rope_scaling: bool = True
+
     def __init__(self, config: ModelConfig, layer_id: int,
                  quant_config: Optional[QuantizationConfig] = None, prefix: str = ""):
         super().__init__()
@@ -50,12 +54,12 @@ class LlamaAttention(nn.Module):
         self.num_heads = config.get_num_attention_heads(tp_size)
         self.num_kv_heads = config.get_num_kv_heads(tp_size)
         self.head_dim = config.head_dim
-        self.q_size = self.num_heads * self.head_dim
+        self.q_size = self.num_heads * self.head_dim * self.q_size_multiplier
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
         self.layer_id = layer_id
 
-        self.qkv_proj = QKVParallelLinear(
+        self.qkv_proj = self.qkv_cls(
             self.hidden_size, self.head_dim, self.num_heads, self.num_kv_heads,
             bias=config.attention_bias, quant_config=quant_config, prefix=f"{prefix}.qkv_proj")
         self.o_proj = RowParallelLinear(
@@ -63,7 +67,8 @@ class LlamaAttention(nn.Module):
             quant_config=quant_config, prefix=f"{prefix}.o_proj")
         self.rotary_emb = get_rope(
             self.head_dim, rotary_dim=config.rotary_dim, max_position=config.context_len,
-            base=config.rope_theta, is_neox_style=True, rope_scaling=config.rope_scaling)
+            base=config.rope_theta, is_neox_style=True,
+            rope_scaling=config.rope_scaling if self.use_rope_scaling else None)
         self.attn = RadixAttention(self.num_heads, self.head_dim, self.scaling, self.num_kv_heads, layer_id,
                                    prefix=f"{prefix}.attn")
 
@@ -89,13 +94,18 @@ class LlamaDecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+    @property
+    def attn_layer(self) -> nn.Module:
+        """Attention block for this layer; hybrid models override it."""
+        return self.self_attn
+
     def forward(self, positions, hidden_states, forward_batch, residual):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(positions, hidden_states, forward_batch)
+        hidden_states = self.attn_layer(positions, hidden_states, forward_batch)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
@@ -103,18 +113,23 @@ class LlamaDecoderLayer(nn.Module):
 
 class LlamaModel(nn.Module):
     def __init__(self, config: ModelConfig, attn_cls: Type[nn.Module] = LlamaAttention,
-                 quant_config: Optional[QuantizationConfig] = None, prefix: str = ""):
+                 quant_config: Optional[QuantizationConfig] = None, prefix: str = "",
+                 layer_cls: Type[nn.Module] = LlamaDecoderLayer, zero_centered: bool = False):
         super().__init__()
         self.config = config
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size, prefix=f"{prefix}.embed_tokens")
         self.layers = nn.ModuleList([
-            LlamaDecoderLayer(config, i, attn_cls, quant_config=quant_config, prefix=f"{prefix}.layers.{i}")
+            layer_cls(config, i, attn_cls, quant_config=quant_config, prefix=f"{prefix}.layers.{i}")
             for i in range(config.num_hidden_layers)
         ])
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, zero_centered=zero_centered)
+
+    def _prepare_forward(self, input_ids, positions, forward_batch, input_embeds) -> None:
+        """Per-model state setup run once before the layer stack."""
 
     def forward(self, input_ids, positions, forward_batch, input_embeds: Optional[torch.Tensor] = None) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids) if input_embeds is None else input_embeds
+        self._prepare_forward(input_ids, positions, forward_batch, input_embeds)
         residual = None
         for layer in self.layers:
             hidden_states, residual = layer(positions, hidden_states, forward_batch, residual)
@@ -126,6 +141,7 @@ class LlamaForCausalLMBase(nn.Module):
     """Shared head/loader for Llama-shaped models; subclasses pick the attention class."""
 
     attn_cls: Type[nn.Module] = LlamaAttention
+    model_cls: Type[nn.Module] = LlamaModel
 
     stacked_params_mapping = [
         # (param_name, weight_name, shard_id)
@@ -140,7 +156,7 @@ class LlamaForCausalLMBase(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = LlamaModel(config, self.attn_cls, quant_config=quant_config, prefix="model")
+        self.model = self.model_cls(config, self.attn_cls, quant_config=quant_config, prefix="model")
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, prefix="lm_head")
         if config.tie_word_embeddings:
             self.lm_head.tie_weights(self.model.embed_tokens)

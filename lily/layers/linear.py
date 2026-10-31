@@ -90,7 +90,11 @@ class MergedColumnParallelLinear(LinearBase):
 
 
 class QKVParallelLinear(LinearBase):
-    """Fused q/k/v projection. Shard ids are "q", "k", "v"."""
+    """Fused q/k/v projection. Shard ids are "q", "k", "v".
+
+    `q_size_multiplier=2` doubles the q block for models that interleave a
+    per-head output gate with each q head (Qwen3.5 full attention).
+    """
 
     def __init__(
         self,
@@ -99,6 +103,7 @@ class QKVParallelLinear(LinearBase):
         total_num_heads: int,
         total_num_kv_heads: Optional[int] = None,
         bias: bool = False,
+        q_size_multiplier: int = 1,
         **kw,
     ):
         self.hidden_size = hidden_size
@@ -107,7 +112,7 @@ class QKVParallelLinear(LinearBase):
         self.total_num_kv_heads = total_num_kv_heads or total_num_heads
         self.num_heads = self.total_num_heads
         self.num_kv_heads = self.total_num_kv_heads
-        self.q_size = self.num_heads * head_size
+        self.q_size = self.num_heads * head_size * q_size_multiplier
         self.kv_size = self.num_kv_heads * head_size
         super().__init__(hidden_size, self.q_size + 2 * self.kv_size, bias, **kw)
 

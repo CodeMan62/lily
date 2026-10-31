@@ -31,45 +31,26 @@ from lily.layers.attention.gated_delta_rule import (
 )
 from lily.layers.layernorm import RMSNorm
 from lily.layers.linear import (
-    LinearBase,
     default_weight_loader,
     MergedColumnParallelLinear,
+    QKVParallelLinear,
     RowParallelLinear,
-    _broadcast_scalar,
 )
 from lily.layers.quantization.base import QuantizationConfig
-from lily.layers.radix_attention import RadixAttention
-from lily.layers.rotary import get_rope
-from lily.layers.vocab_embedding import ParallelLMHead, VocabParallelEmbedding
 from lily.model_executor.forward_batch_info import ForwardBatch
-from lily.models.llama import LlamaForCausalLMBase, LlamaMLP
+from lily.models.llama import LlamaAttention, LlamaDecoderLayer, LlamaForCausalLMBase, LlamaMLP, LlamaModel
 from lily.models.model_config import ModelConfig
 from lily.models.registry import ModelRegistry
 
 
-class GateQKVParallelLinear(LinearBase):
+class GateQKVParallelLinear(QKVParallelLinear):
     """QKV projection whose q block carries the fused output-per-head gate:
     per-q head rows are [q; gate] (2x head_dim). Shard ids "q"/"k"/"v"."""
 
     def __init__(self, hidden_size: int, head_size: int, total_num_heads: int,
                  total_num_kv_heads: Optional[int] = None, bias: bool = False, **kw):
-        self.head_size = head_size
-        self.num_heads = total_num_heads
-        self.num_kv_heads = total_num_kv_heads or total_num_heads
-        self.q_size = self.num_heads * head_size * 2
-        self.kv_size = self.num_kv_heads * head_size
-        super().__init__(hidden_size, self.q_size + 2 * self.kv_size, bias, **kw)
-
-    def weight_loader(self, param, loaded_weight, loaded_shard_id: Optional[str] = None):
-        if loaded_shard_id is None:
-            default_weight_loader(param, loaded_weight)
-            return
-        offsets = {"q": 0, "k": self.q_size, "v": self.q_size + self.kv_size}
-        sizes = {"q": self.q_size, "k": self.kv_size, "v": self.kv_size}
-        off, size = offsets[loaded_shard_id], sizes[loaded_shard_id]
-        loaded_weight = _broadcast_scalar(loaded_weight, size)  # per-tensor quant scalars
-        assert loaded_weight.shape[0] == size, (loaded_shard_id, loaded_weight.shape, size)
-        param.data.narrow(0, off, size).copy_(loaded_weight)
+        super().__init__(hidden_size, head_size, total_num_heads, total_num_kv_heads, bias,
+                         q_size_multiplier=2, **kw)
 
 
 class _Conv1d(nn.Module):
@@ -81,36 +62,19 @@ class _Conv1d(nn.Module):
             torch.empty(conv_dim, 1, kernel_size, dtype=torch.bfloat16), requires_grad=False)
 
 
-class Qwen3_5Attention(nn.Module):
+class Qwen3_5Attention(LlamaAttention):
     """Full-attention block: per-head q/k RMSNorm, partial NeoX rotary and the
     fused per-head output gate (`attn_output_gate = True`)."""
 
+    qkv_cls = GateQKVParallelLinear
+    q_size_multiplier = 2
+    use_rope_scaling = False
+
     def __init__(self, config: ModelConfig, layer_id: int,
                  quant_config: Optional[QuantizationConfig] = None, prefix: str = ""):
-        super().__init__()
-        self.hidden_size = config.hidden_size
-        tp_size, _ = get_tp_info()
-        self.num_heads = config.get_num_attention_heads(tp_size)
-        self.num_kv_heads = config.get_num_kv_heads(tp_size)
-        self.head_dim = config.head_dim
-        self.q_size = self.num_heads * self.head_dim * 2
-        self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim ** -0.5
-        self.layer_id = layer_id
-
-        self.qkv_proj = GateQKVParallelLinear(
-            self.hidden_size, self.head_dim, self.num_heads, self.num_kv_heads,
-            bias=config.attention_bias, quant_config=quant_config, prefix=f"{prefix}.qkv_proj")
-        self.o_proj = RowParallelLinear(
-            config.num_attention_heads * self.head_dim, self.hidden_size, bias=config.attention_bias,
-            quant_config=quant_config, prefix=f"{prefix}.o_proj")
+        super().__init__(config, layer_id, quant_config=quant_config, prefix=prefix)
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps, zero_centered=True)
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps, zero_centered=True)
-        self.rotary_emb = get_rope(
-            self.head_dim, rotary_dim=config.rotary_dim, max_position=config.context_len,
-            base=config.rope_theta, is_neox_style=True)
-        self.attn = RadixAttention(self.num_heads, self.head_dim, self.scaling, self.num_kv_heads, layer_id,
-                                   prefix=f"{prefix}.attn")
 
     def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
         n = positions.shape[0]
@@ -313,10 +277,10 @@ class GatedDeltaNet(nn.Module):
         return out.squeeze(0)
 
 
-class Qwen3_5DecoderLayer(nn.Module):
-    def __init__(self, config: ModelConfig, layer_id: int,
+class Qwen3_5DecoderLayer(LlamaDecoderLayer):
+    def __init__(self, config: ModelConfig, layer_id: int, attn_cls=None,
                  quant_config: Optional[QuantizationConfig] = None, prefix: str = ""):
-        super().__init__()
+        nn.Module.__init__(self)
         block_type = config.layer_types[layer_id]
         self.hidden_size = config.hidden_size
         # Module attribute names match the checkpoint (`linear_attn` / `self_attn`)
@@ -333,48 +297,29 @@ class Qwen3_5DecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, zero_centered=True)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, zero_centered=True)
 
-    def forward(self, positions, hidden_states, forward_batch, residual):
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        ih = self.linear_attn if self.block_type == "linear_attention" else self.self_attn
-        hidden_states = ih(positions, hidden_states, forward_batch)
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
-        return hidden_states, residual
+    @property
+    def attn_layer(self) -> nn.Module:
+        return self.linear_attn if self.block_type == "linear_attention" else self.self_attn
 
 
-class Qwen3_5Model(nn.Module):
-    def __init__(self, config: ModelConfig, quant_config: Optional[QuantizationConfig] = None, prefix: str = ""):
-        super().__init__()
-        self.config = config
-        self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size,
-                                                   prefix=f"{prefix}.embed_tokens")
-        self.layers = nn.ModuleList([
-            Qwen3_5DecoderLayer(config, i, quant_config=quant_config, prefix=f"{prefix}.layers.{i}")
-            for i in range(config.num_hidden_layers)
-        ])
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, zero_centered=True)
+class Qwen3_5Model(LlamaModel):
+    def __init__(self, config: ModelConfig, attn_cls=None,
+                 quant_config: Optional[QuantizationConfig] = None, prefix: str = ""):
+        super().__init__(config, quant_config=quant_config, prefix=prefix,
+                         layer_cls=Qwen3_5DecoderLayer, zero_centered=True)
 
-    def forward(self, input_ids, positions, forward_batch, input_embeds: Optional[torch.Tensor] = None) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids) if input_embeds is None else input_embeds
+    def _prepare_forward(self, input_ids, positions, forward_batch, input_embeds) -> None:
         # Fresh requests (no cached prefix) start from zeroed linear-attention
         # states; continuation chunks keep theirs. Skipped in decode mode so
         # CUDA-graph replay never bakes a zero pass in.
         pool = forward_batch.token_to_kv_pool.mamba_pool
-        if pool is not None and forward_batch.extend_prefix_lens_cpu is not None \
-                and not forward_batch.forward_mode.is_decode():
-            fresh = [i for i, p in enumerate(forward_batch.extend_prefix_lens_cpu) if p == 0]
-            if fresh:
-                fresh_idx = torch.tensor(fresh, dtype=torch.int64, device=hidden_states.device)
-                pool.zero_slots(forward_batch.req_pool_indices[fresh_idx])
-        residual = None
-        for layer in self.layers:
-            hidden_states, residual = layer(positions, hidden_states, forward_batch, residual)
-        hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+        if pool is None or forward_batch.extend_prefix_lens_cpu is None \
+                or forward_batch.forward_mode.is_decode():
+            return
+        fresh = [i for i, p in enumerate(forward_batch.extend_prefix_lens_cpu) if p == 0]
+        if fresh:
+            fresh_idx = torch.tensor(fresh, dtype=torch.int64, device=positions.device)
+            pool.zero_slots(forward_batch.req_pool_indices[fresh_idx])
 
 
 def _rank_segments(w: torch.Tensor, n_k: int, n_v: int, hd: int, vd: int, tp_rank: int, tp_size: int):
@@ -392,22 +337,7 @@ class Qwen3_5ForCausalLM(LlamaForCausalLMBase):
     """Remaps `model.language_model.*` checkpoint names, ignores vision/MTP
     tensors, and slices the fused `in_proj_qkv`/`conv1d` checkpoints per rank."""
 
-    stacked_params_mapping = [
-        ("qkv_proj", "q_proj", "q"),
-        ("qkv_proj", "k_proj", "k"),
-        ("qkv_proj", "v_proj", "v"),
-        ("gate_up_proj", "gate_proj", 0),
-        ("gate_up_proj", "up_proj", 1),
-    ]
-
-    def __init__(self, config: ModelConfig, quant_config: Optional[QuantizationConfig] = None, prefix: str = ""):
-        nn.Module.__init__(self)  # not LlamaForCausalLMBase's llama-layer __init__
-        self.config = config
-        self.quant_config = quant_config
-        self.model = Qwen3_5Model(config, quant_config=quant_config, prefix="model")
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, prefix="lm_head")
-        if config.tie_word_embeddings:
-            self.lm_head.tie_weights(self.model.embed_tokens)
+    model_cls = Qwen3_5Model
 
     def load_weights(self, weights: Iterable[tuple]) -> tuple[Set[str], Set[str]]:
         params_dict = dict(self.named_parameters())

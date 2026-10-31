@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional, Union
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from lily.scheduler.io_struct import GenerateReqInput
 
@@ -26,9 +26,10 @@ logger = logging.getLogger(__name__)
 
 # ---- request models --------------------------------------------------------
 
-class CompletionRequest(BaseModel):
+class _SamplingRequest(BaseModel):
+    """Fields shared by the OpenAI completion endpoints."""
+
     model: Optional[str] = None
-    prompt: Union[str, List[str]] = ""
     max_tokens: Optional[int] = None
     temperature: float = 0.0
     top_p: float = 1.0
@@ -43,28 +44,17 @@ class CompletionRequest(BaseModel):
     stream: bool = False
     n: int = 1
     seed: Optional[int] = None
+
+
+class CompletionRequest(_SamplingRequest):
+    prompt: Union[str, List[str]] = ""
     logprobs: Optional[int] = None
     echo: bool = False
 
 
-class ChatCompletionRequest(BaseModel):
-    model: Optional[str] = None
+class ChatCompletionRequest(_SamplingRequest):
     messages: List[Dict[str, Any]]
-    max_tokens: Optional[int] = None
     max_completion_tokens: Optional[int] = None
-    temperature: float = 0.0
-    top_p: float = 1.0
-    top_k: int = -1
-    min_p: float = 0.0
-    repetition_penalty: float = 1.0
-    frequency_penalty: float = 0.0
-    presence_penalty: float = 0.0
-    stop: Optional[Union[str, List[str]]] = None
-    stop_token_ids: Optional[List[int]] = None
-    ignore_eos: bool = False
-    stream: bool = False
-    n: int = 1
-    seed: Optional[int] = None
     logprobs: bool = False
     top_logprobs: Optional[int] = None
     chat_template_kwargs: Optional[Dict[str, Any]] = None
@@ -112,6 +102,20 @@ def _sampling_params(body: Any) -> Dict[str, Any]:
 
 def _sse(payload: Dict[str, Any]) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _usage(meta: Dict[str, Any]) -> Dict[str, int]:
+    prompt = meta.get("prompt_tokens", 0)
+    completion = meta.get("completion_tokens", 0)
+    return {"prompt_tokens": prompt, "completion_tokens": completion,
+            "total_tokens": prompt + completion}
+
+
+def _text_choice(text: str, meta: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "text": text, "index": 0, "logprobs": None,
+        "finish_reason": _finish_reason(meta.get("finish_reason")),
+    }
 
 
 # ---- app -------------------------------------------------------------------
@@ -190,15 +194,8 @@ def create_app(frontend, server_args) -> FastAPI:
                 meta = chunk["meta_info"]
                 return JSONResponse({
                     "id": rid, "object": "text_completion", "created": created, "model": model_name,
-                    "choices": [{
-                        "text": chunk["text"], "index": 0, "logprobs": None,
-                        "finish_reason": _finish_reason(meta.get("finish_reason")),
-                    }],
-                    "usage": {
-                        "prompt_tokens": meta.get("prompt_tokens", 0),
-                        "completion_tokens": meta.get("completion_tokens", 0),
-                        "total_tokens": meta.get("prompt_tokens", 0) + meta.get("completion_tokens", 0),
-                    },
+                    "choices": [_text_choice(chunk["text"], meta)],
+                    "usage": _usage(meta),
                 })
 
         async def stream():
@@ -209,10 +206,7 @@ def create_app(frontend, server_args) -> FastAPI:
                 meta = chunk["meta_info"]
                 yield _sse({
                     "id": rid, "object": "text_completion", "created": created, "model": model_name,
-                    "choices": [{
-                        "text": chunk["text"], "index": 0, "logprobs": None,
-                        "finish_reason": _finish_reason(meta.get("finish_reason")),
-                    }],
+                    "choices": [_text_choice(chunk["text"], meta)],
                 })
             yield "data: [DONE]\n\n"
         return StreamingResponse(stream(), media_type="text/event-stream")
@@ -240,11 +234,7 @@ def create_app(frontend, server_args) -> FastAPI:
                         "index": 0, "message": message,
                         "finish_reason": _finish_reason(meta.get("finish_reason")),
                     }],
-                    "usage": {
-                        "prompt_tokens": meta.get("prompt_tokens", 0),
-                        "completion_tokens": meta.get("completion_tokens", 0),
-                        "total_tokens": meta.get("prompt_tokens", 0) + meta.get("completion_tokens", 0),
-                    },
+                    "usage": _usage(meta),
                 })
 
         async def stream():

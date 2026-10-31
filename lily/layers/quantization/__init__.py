@@ -5,14 +5,14 @@ from __future__ import annotations
 from typing import Optional
 
 from lily.layers.quantization.base import (
+    CompressedInt4Config,
     LinearMethodBase,
+    NVFP4Config,
     QuantizationConfig,
     QuantizeMethodBase,
     UnquantizedLinearMethod,
     get_linear_method,
 )
-from lily.layers.quantization.compressed_int4 import CompressedInt4Config
-from lily.layers.quantization.nvfp4 import NVFP4Config
 from lily.layers.quantization.weight_only import FP8Config, W4A16Config, W8A16Config
 
 _QUANT_CONFIGS = {
