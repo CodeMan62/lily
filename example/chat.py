@@ -23,7 +23,9 @@ def main() -> None:
     parser.add_argument("--base-url", default="http://127.0.0.1:30000/v1")
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B", help="served model name")
     parser.add_argument("--max-tokens", type=int, default=2048)
-    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--temperature", type=float, default=0.6)
+    parser.add_argument("--top-p", type=float, default=0.95)
+    parser.add_argument("--top-k", type=int, default=20, help="-1 disables")
     parser.add_argument("--no-stream", action="store_true", help="wait for the whole answer")
     parser.add_argument("--no-think", action="store_true", help="disable Qwen3 thinking mode")
     args = parser.parse_args()
@@ -50,7 +52,7 @@ def main() -> None:
 
         messages.append({"role": "user", "content": question})
         print("bot> ", end="", flush=True)
-        extra: dict = {}
+        extra: dict = {"top_p": args.top_p, "extra_body": {"top_k": args.top_k}}
         if args.no_think:
             extra["chat_template_kwargs"] = {"enable_thinking": False}
 
@@ -71,17 +73,30 @@ def main() -> None:
             )
             answer = ""
             reasoning = ""
-            shown_thinking = False
+            finish_reason = None
+            thinking_open = False
             for chunk in stream:
-                delta = chunk.choices[0].delta
+                choice = chunk.choices[0]
+                finish_reason = choice.finish_reason or finish_reason
+                delta = choice.delta
+                if getattr(delta, "reasoning_content", None):
+                    # stream the thinking as it arrives (dim), instead of holding it back
+                    if not thinking_open:
+                        print("\033[2m(thinking) ", end="", flush=True)
+                        thinking_open = True
+                    reasoning += delta.reasoning_content
+                    print(delta.reasoning_content, end="", flush=True)
                 if delta.content:
-                    if reasoning and not shown_thinking:
-                        print(f"\033[2m(thinking) {reasoning}\033[0m", end="\n\n")
-                        shown_thinking = True
+                    if thinking_open:
+                        print("\033[0m\n", flush=True)
+                        thinking_open = False
                     answer += delta.content
                     print(delta.content, end="", flush=True)
-                elif getattr(delta, "reasoning_content", None):
-                    reasoning += delta.reasoning_content
+            if thinking_open:
+                print("\033[0m")
+            if not answer:
+                print(f"(no answer: finish_reason={finish_reason}, {len(reasoning)} chars of thinking"
+                      f"{'; raise --max-tokens' if finish_reason == 'length' else ''})")
             print()
 
         messages.append({"role": "assistant", "content": answer})
