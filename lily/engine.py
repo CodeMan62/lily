@@ -35,6 +35,8 @@ class EngineConfig:
     tp_size: int = 1
     rank: int = 0
     dist_init_addr: str = DEFAULT_DIST_INIT_ADDR
+    # Any other ServerArgs field, e.g. {"mamba_ssm_dtype": "bfloat16", "quantize_lm_head": "nvfp4"}.
+    server_args: Optional[dict] = None
 
 class Engine:
     def __init__(self, config: EngineConfig):
@@ -47,7 +49,8 @@ class Engine:
                                       max_total_tokens=config.max_total_tokens,
                                       mem_fraction_static=config.mem_fraction_static,
                                       tp_size=config.tp_size,
-                                      dist_init_addr=config.dist_init_addr)
+                                      dist_init_addr=config.dist_init_addr,
+                                      **(config.server_args or {}))
         self.model_config = ModelConfig.from_pretrained(config.model_path, dtype=config.dtype,
                                                         context_length=config.context_length)
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_config.model_path)

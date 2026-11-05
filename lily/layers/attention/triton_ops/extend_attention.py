@@ -82,9 +82,9 @@ def _fwd_kernel(
         k = tl.load(K_Buffer + offs_buf_k, mask=mask_n[None, :] & mask_d[:, None], other=0.0)
 
         if IEEE:
-            qk = tl.dot(q.to(k.dtype), k, input_precision="ieee")
+            qk = tl.dot(q, k.to(q.dtype), input_precision="ieee")
         else:
-            qk = tl.dot(q.to(k.dtype), k)
+            qk = tl.dot(q, k.to(q.dtype))
         qk *= sm_scale
 
         if USE_CUSTOM_MASK:
@@ -107,9 +107,9 @@ def _fwd_kernel(
         offs_buf_v = offs_kv_loc[:, None] * stride_buf_vbs + cur_kv_head * stride_buf_vh + offs_dv[None, :]
         v = tl.load(V_Buffer + offs_buf_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0)
         if IEEE:
-            acc = acc * re_scale[:, None] + tl.dot(p.to(v.dtype), v, input_precision="ieee")
+            acc = acc * re_scale[:, None] + tl.dot(p.to(q.dtype), v.to(q.dtype), input_precision="ieee")
         else:
-            acc = acc * re_scale[:, None] + tl.dot(p.to(v.dtype), v)
+            acc = acc * re_scale[:, None] + tl.dot(p.to(q.dtype), v.to(q.dtype))
         e_max = n_e_max
 
     # ---- stage 2: new extend tokens, causal --------------------------------
@@ -126,9 +126,9 @@ def _fwd_kernel(
         k = tl.load(K_Extend + offs_k, mask=mask_n[None, :] & mask_d[:, None], other=0.0)
 
         if IEEE:
-            qk = tl.dot(q.to(k.dtype), k, input_precision="ieee")
+            qk = tl.dot(q, k.to(q.dtype), input_precision="ieee")
         else:
-            qk = tl.dot(q.to(k.dtype), k)
+            qk = tl.dot(q, k.to(q.dtype))
         qk *= sm_scale
 
         if USE_CUSTOM_MASK:
@@ -156,9 +156,9 @@ def _fwd_kernel(
         )
         v = tl.load(V_Extend + offs_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0)
         if IEEE:
-            acc = acc * re_scale[:, None] + tl.dot(p.to(v.dtype), v, input_precision="ieee")
+            acc = acc * re_scale[:, None] + tl.dot(p.to(q.dtype), v.to(q.dtype), input_precision="ieee")
         else:
-            acc = acc * re_scale[:, None] + tl.dot(p.to(v.dtype), v)
+            acc = acc * re_scale[:, None] + tl.dot(p.to(q.dtype), v.to(q.dtype))
         e_max = n_e_max
 
     offs_o = (

@@ -12,6 +12,7 @@ DEFAULT_DIST_INIT_ADDR = "127.0.0.1:2333"
 
 _TP_SIZE = 1
 _TP_RANK = 0
+_BACKEND = "nccl"
 _DEVICE_GROUP: Optional[dist.ProcessGroup] = None
 _CPU_GROUP: Optional[dist.ProcessGroup] = None
 
@@ -21,16 +22,18 @@ def init_distributed_environment(
     tp_rank: int,
     dist_init_addr: str = DEFAULT_DIST_INIT_ADDR,
     device: Optional[torch.device] = None,
+    backend: str = "nccl",
 ) -> None:
-    global _TP_SIZE, _TP_RANK, _DEVICE_GROUP, _CPU_GROUP
-    _TP_SIZE, _TP_RANK = tp_size, tp_rank
+    """`backend` "gloo" lets several ranks share one GPU (tests of the sharding logic)."""
+    global _TP_SIZE, _TP_RANK, _DEVICE_GROUP, _CPU_GROUP, _BACKEND
+    _TP_SIZE, _TP_RANK, _BACKEND = tp_size, tp_rank, backend
     if tp_size == 1:
         return
     if device is not None and device.type == "cuda":
         torch.cuda.set_device(device)
     if not dist.is_initialized():
         dist.init_process_group(
-            backend="nccl",
+            backend=backend,
             init_method=f"tcp://{dist_init_addr}",
             world_size=tp_size,
             rank=tp_rank,
@@ -68,7 +71,10 @@ def tensor_model_parallel_all_gather(x: torch.Tensor, dim: int = -1) -> torch.Te
     dim = dim % x.dim()
     x = x.contiguous()
     out = torch.empty((_TP_SIZE,) + tuple(x.shape), dtype=x.dtype, device=x.device)
-    dist.all_gather_single(out, x, group=_DEVICE_GROUP)
+    if _BACKEND == "gloo":      # no all_gather_into_tensor for CUDA tensors on gloo
+        dist.all_gather(list(out.unbind(0)), x, group=_DEVICE_GROUP)
+    else:
+        dist.all_gather_into_tensor(out, x, group=_DEVICE_GROUP)
     # [tp, ..., d, ...] -> [..., tp * d, ...]
     out = out.movedim(0, dim)
     return out.reshape(x.shape[:dim] + (_TP_SIZE * x.shape[dim],) + x.shape[dim + 1:])

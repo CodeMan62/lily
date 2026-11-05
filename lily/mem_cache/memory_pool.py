@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import abc
 import logging
+import os
 from typing import List, Optional, Union
 
 import torch
@@ -18,12 +19,17 @@ logger = logging.getLogger(__name__)
 
 
 class ReqToTokenPool:
+    """Request slot -> row of KV indices. Slot 0 is never handed out: CUDA-graph
+    padding rows point at it (their req_pool_indices buffer is zero), so a real
+    request there would have its per-request state (GDN conv/recurrent states)
+    clobbered on every padded replay."""
+
     def __init__(self, size: int, max_context_len: int, device: torch.device | str):
         self.size = size
         self.max_context_len = max_context_len
         self.device = device
         self.req_to_token = torch.zeros((size, max_context_len), dtype=torch.int32, device=device)
-        self.free_slots: List[int] = list(range(size))
+        self.free_slots: List[int] = list(range(1, size))
 
     def write(self, indices, values) -> None:
         """indices: (req_idx, slice) or tensor; values: KV-pool indices."""
@@ -46,7 +52,7 @@ class ReqToTokenPool:
             self.free_slots.extend(free_index)
 
     def clear(self) -> None:
-        self.free_slots = list(range(self.size))
+        self.free_slots = list(range(1, self.size))
 
 
 class KVCache(abc.ABC):
@@ -186,11 +192,26 @@ class MambaStatePool:
             torch.zeros((size, num_v_heads, k_head_dim, v_head_dim), dtype=dtype, device=device)
             for _ in range(num_layers)
         ]
+        # Pre-step copies for speculative-verify rollback; allocated on demand.
+        self.conv_snapshots: Optional[List[torch.Tensor]] = None
+        self.recurrent_snapshots: Optional[List[torch.Tensor]] = None
+        from lily.layers.quantization import cuda_ops
+
+        self.fused = (
+            not os.environ.get("LILY_DISABLE_FUSED_GDN")
+            and torch.device(device).type == "cuda"
+            and cuda_ops.gdn_fused_supported(k_head_dim, v_head_dim, kernel_size, dtype)
+        )
         gb = self.get_size_bytes() / (1 << 30)
         logger.info(
-            "mamba state pool: %d slots x %d linear-attention layers, %.2f GB",
-            size, num_layers, gb,
+            "mamba state pool: %d slots x %d linear-attention layers, %.2f GB, %s, fused kernel %s",
+            size, num_layers, gb, str(dtype).replace("torch.", ""), "on" if self.fused else "off",
         )
+
+    def alloc_snapshots(self) -> None:
+        if self.conv_snapshots is None:
+            self.conv_snapshots = [torch.zeros_like(t) for t in self.conv_states]
+            self.recurrent_snapshots = [torch.zeros_like(t) for t in self.recurrent_states]
 
     def get_size_bytes(self) -> int:
         conv = sum(b.numel() * b.element_size() for b in self.conv_states)
@@ -245,10 +266,48 @@ class MambaStatePool:
         return (conv + rec) * self.num_layers
 
     @classmethod
-    def per_slot_bytes_for_model_config(cls, cfg) -> int:
+    def per_slot_bytes_for_model_config(cls, cfg, dtype: Optional[torch.dtype] = None) -> int:
         """Bytes per request slot without allocating the pool."""
         v_heads, hd, vd, conv_dim, kernel_size, num_layers = cls._dims_for_model_config(cfg)
-        itemsize = cfg.mamba_state_dtype.itemsize
+        itemsize = (dtype or cfg.mamba_state_dtype).itemsize
         conv = conv_dim * kernel_size * itemsize
         rec = v_heads * hd * vd * itemsize
         return (conv + rec) * num_layers
+
+
+class MLATokenToKVPool(KVCache):
+    """Latent KV cache for MLA layers (GLM-5.3-Flash): per layer one [size + 1, kv_lora_rank]
+    buffer holding each token's compressed latent, and for layers that run a DSA indexer one
+    [size + 1, index_width] buffer of indexer entries (key | pool-gate logits). Slot 0 is the
+    reserved padding slot like the other pools. Linear-attention states, when the model has
+    them, hang off `mamba_pool` as for `HybridTokenToKVPool`."""
+
+    def __init__(self, size: int, dtype: torch.dtype, kv_lora_rank: int, layer_ids: List[int],
+                 index_width: int, index_layer_ids: List[int], device: torch.device | str):
+        self.size = size
+        self.dtype = dtype
+        self.device = device
+        self.kv_lora_rank = kv_lora_rank
+        self.index_width = index_width
+        self.latent = {lid: torch.zeros((size + 1, kv_lora_rank), dtype=dtype, device=device) for lid in layer_ids}
+        self.index = {lid: torch.zeros((size + 1, index_width), dtype=dtype, device=device) for lid in index_layer_ids}
+        self.mamba_pool: Optional[MambaStatePool] = None
+        logger.info("MLA latent cache allocated: %d tokens x %d layers (+%d indexer layers), %.2f GB",
+                    size, len(layer_ids), len(index_layer_ids), self.get_kv_size_bytes() / (1 << 30))
+
+    @staticmethod
+    def cell_size_bytes(kv_lora_rank: int, num_layers: int, index_width: int, num_index_layers: int,
+                        dtype: torch.dtype) -> int:
+        return (kv_lora_rank * num_layers + index_width * num_index_layers) * dtype.itemsize
+
+    def get_kv_size_bytes(self) -> int:
+        return sum(b.numel() * b.element_size() for b in list(self.latent.values()) + list(self.index.values()))
+
+    def get_key_buffer(self, layer_id: int) -> torch.Tensor:
+        return self.latent[layer_id]
+
+    def get_value_buffer(self, layer_id: int) -> torch.Tensor:  # pragma: no cover
+        raise RuntimeError("MLA layers cache latents, not K/V; use get_key_buffer")
+
+    def set_kv_buffer(self, layer_id: int, loc: torch.Tensor, cache_k: torch.Tensor, cache_v: torch.Tensor) -> None:
+        self.latent[layer_id][loc] = cache_k.to(self.dtype)

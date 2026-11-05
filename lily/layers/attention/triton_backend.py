@@ -18,10 +18,12 @@ if TYPE_CHECKING:
 
 
 class TritonAttnBackend(AttentionBackend):
-    def __init__(self, model_runner: "ModelRunner", num_kv_splits: int = 8):
+    def __init__(self, model_runner: "ModelRunner", num_kv_splits: int = 8, kv_pool=None):
         self.device = model_runner.device
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
-        self.token_to_kv_pool = model_runner.token_to_kv_pool
+        # `kv_pool` lets a second backend serve another KV pool over the same
+        # request rows (the MTP draft layer's cache).
+        self.token_to_kv_pool = kv_pool or model_runner.token_to_kv_pool
         self.num_q_heads = model_runner.num_attention_heads  # per TP rank
         self.v_head_dim = model_runner.model_config.head_dim
         self.num_kv_splits = num_kv_splits
@@ -53,6 +55,20 @@ class TritonAttnBackend(AttentionBackend):
             return
 
         prefix_lens = forward_batch.extend_prefix_lens
+        static = forward_batch.graph_static
+        if static is not None:
+            # Fixed-shape extend inside a CUDA graph: cumsum + gather into preallocated
+            # buffers, no host sync (kv_indices is sized for the whole context).
+            kv_indptr = static["kv_indptr"][: bs + 1]       # index 0 stays zero from allocation
+            kv_indptr[1:] = torch.cumsum(prefix_lens, dim=0)
+            kv_indices = static["kv_indices"]
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token, forward_batch.req_pool_indices, prefix_lens,
+                kv_indptr, None, kv_indices, self.req_to_token.stride(0),
+            )
+            qo_indptr = static["qo_indptr"][: bs + 1]
+            self.forward_metadata = (None, kv_indptr, kv_indices, qo_indptr, max(forward_batch.extend_seq_lens_cpu))
+            return
         kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=self.device)
         kv_indptr[1:] = torch.cumsum(prefix_lens, dim=0)
         total_prefix = int(kv_indptr[-1])

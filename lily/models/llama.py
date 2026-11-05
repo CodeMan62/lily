@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Iterable, Optional, Set, Tuple, Type
+import logging
+
+from typing import Iterable, List, Optional, Set, Tuple, Type
 
 import torch
 import torch.nn.functional as F
@@ -13,13 +15,17 @@ from lily.models.model_config import ModelConfig
 from lily.layers.layernorm import RMSNorm
 from lily.layers.linear import MergedColumnParallelLinear, QKVParallelLinear, RowParallelLinear, default_weight_loader
 from lily.layers.logits_processor import LogitsProcessorOutput
-from lily.layers.quantization.base import QuantizationConfig
+from lily.layers.quantization.base import (
+    OnlineNVFP4LinearMethod, QuantizationConfig, UnquantizedLinearMethod, _IgnoredPrefixConfig,
+)
 from lily.layers.radix_attention import RadixAttention
 from lily.layers.rotary import get_rope
 from lily.layers.vocab_embedding import ParallelLMHead, VocabParallelEmbedding
 from lily.distributed import get_tp_info
 from lily.model_executor.forward_batch_info import ForwardBatch
 from lily.models.registry import ModelRegistry
+
+logger = logging.getLogger(__name__)
 
 
 class LlamaMLP(nn.Module):
@@ -131,9 +137,16 @@ class LlamaModel(nn.Module):
         hidden_states = self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         self._prepare_forward(input_ids, positions, forward_batch, input_embeds)
         residual = None
-        for layer in self.layers:
+        aux_layers = forward_batch.capture_aux_layers
+        aux: List[torch.Tensor] = []
+        for i, layer in enumerate(self.layers):
             hidden_states, residual = layer(positions, hidden_states, forward_batch, residual)
+            if aux_layers is not None and i in aux_layers:
+                # the full residual stream after layer i (HF's hidden_states[i + 1])
+                aux.append(hidden_states + residual if residual is not None else hidden_states)
         hidden_states, _ = self.norm(hidden_states, residual)
+        if aux_layers is not None:
+            forward_batch.aux_hidden_states = torch.cat(aux, dim=-1)
         return hidden_states
 
 
@@ -157,22 +170,43 @@ class LlamaForCausalLMBase(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.model = self.model_cls(config, self.attn_cls, quant_config=quant_config, prefix="model")
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, prefix="lm_head")
+        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, prefix="lm_head",
+                                      quant_method=self._lm_head_quant_method(config, quant_config))
         if config.tie_word_embeddings:
             self.lm_head.tie_weights(self.model.embed_tokens)
+
+    @staticmethod
+    def _lm_head_quant_method(config: ModelConfig, quant_config: Optional[QuantizationConfig]):
+        """Checkpoint-quantized lm_head wins; else the online request (`--quantize-lm-head`)."""
+        if config.tie_word_embeddings:
+            if config.lm_head_quantization:
+                logger.warning("lm_head is tied to the embeddings; --quantize-lm-head ignored")
+            return None
+        # Only pre-quantized checkpoints carry a quantized lm_head; the online
+        # `--quantization` methods leave it alone unless asked via --quantize-lm-head.
+        if isinstance(quant_config, _IgnoredPrefixConfig):
+            method = quant_config.get_quant_method(None, "lm_head")
+            if method is not None and not isinstance(method, UnquantizedLinearMethod):
+                return method
+        if config.lm_head_quantization == "nvfp4":
+            return OnlineNVFP4LinearMethod()
+        return None
 
     @torch.no_grad()
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor, forward_batch: ForwardBatch,
                 input_embeds: Optional[torch.Tensor] = None) -> LogitsProcessorOutput:
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         mode = forward_batch.forward_mode
-        if mode.is_decode() or mode.is_idle():
+        if mode.is_decode() or mode.is_idle() or forward_batch.return_all_logits:
             last_hidden = hidden_states
         else:
             last_index = forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
             last_hidden = hidden_states[last_index]
         logits = self.lm_head.compute_logits(last_hidden)
-        return LogitsProcessorOutput(next_token_logits=logits)
+        return LogitsProcessorOutput(
+            next_token_logits=logits,
+            hidden_states=hidden_states if forward_batch.capture_hidden_states else None,
+            aux_hidden_states=getattr(forward_batch, "aux_hidden_states", None))
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Tuple[Set[str], Set[str]]:
         """Returns (loaded_param_names, unexpected_weight_names)."""

@@ -45,6 +45,16 @@ class Req:
     pending_free: bool = False
     lookahead: int = 0
     future_valid: bool = False
+    # Speculative decoding (MTP): next round's first draft token, the draft hidden
+    # state that produced it, and its draft distribution (sampling only).
+    spec_draft_token: Optional[torch.Tensor] = None   # 0-d int64 on the device
+    spec_draft_hidden: Optional[torch.Tensor] = None
+    spec_draft_probs: Optional[torch.Tensor] = None
+
+    def clear_spec_state(self) -> None:
+        self.spec_draft_token = None
+        self.spec_draft_hidden = None
+        self.spec_draft_probs = None
 
     def __post_init__(self) -> None:
         self.origin_input_ids = list(self.origin_input_ids)
@@ -112,6 +122,10 @@ class ModelWorkerBatch:
     seq_lens_cpu: Optional[List[int]] = None
     sampling_info: Optional[SamplingBatchInfo] = None
     batch_size: int = 0
+    # Speculative decoding: the requests themselves (in-process worker) and the number
+    # of draft tokens this round (out_cache_loc then holds (spec_num_draft + 1) slots per request).
+    reqs: Optional[List[Any]] = None
+    spec_num_draft: int = 0
 
 
 class ScheduleBatch:
@@ -139,6 +153,7 @@ class ScheduleBatch:
         self.sampling_info = SamplingBatchInfo.from_reqs(self.reqs)
         # In a MIXED batch the first `num_decode_reqs` requests are decoding.
         self.num_decode_reqs = 0
+        self.spec_num_draft = 0
 
     # ---- KV allocation -----------------------------------------------------
 
@@ -248,6 +263,36 @@ class ScheduleBatch:
             input_lists = [[r.output_ids[-1]] for r in self.reqs]
             self._finalize(ext_lens, input_lists, ForwardMode.DECODE)
 
+    def prepare_for_spec_decode(self, num_draft: int) -> None:
+        """One speculative round: allocate `num_draft + 1` KV slots per request (verify
+        positions seq_len..seq_len+num_draft) and write them into req_to_token, but
+        leave `req.seq_len` at the committed length; the scheduler advances it by the
+        number of tokens the round actually commits and frees the rest."""
+        self._ensure_req_slots()
+        n = num_draft + 1
+        out_loc = self._alloc_tokens(n * len(self.reqs))
+        seq_lens: List[int] = []
+        for i, req in enumerate(self.reqs):
+            prefix = req.seq_len
+            values = out_loc[i * n:(i + 1) * n].to(torch.int32)
+            self.req_to_token_pool.write((req.req_pool_idx, slice(prefix, prefix + n)), values)
+            seq_lens.append(prefix + n)
+        self.forward_mode = ForwardMode.DECODE
+        self.spec_num_draft = num_draft
+        self.input_ids = torch.tensor([r.output_ids[-1] for r in self.reqs], dtype=torch.int64, device=self.device)
+        self.positions = torch.tensor([r.seq_len for r in self.reqs], dtype=torch.int64, device=self.device)
+        self.req_pool_indices = torch.tensor([r.req_pool_idx for r in self.reqs], dtype=torch.int64, device=self.device)
+        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=self.device)
+        self.out_cache_loc = out_loc
+        self.seq_lens_cpu = seq_lens
+        self.extend_seq_lens_cpu = [n] * len(self.reqs)
+        self.extend_prefix_lens_cpu = [r.seq_len for r in self.reqs]
+        self.extend_seq_lens = torch.tensor(self.extend_seq_lens_cpu, dtype=torch.int64, device=self.device)
+        self.extend_prefix_lens = torch.tensor(self.extend_prefix_lens_cpu, dtype=torch.int64, device=self.device)
+        self.extend_start_loc = torch.arange(0, n * len(self.reqs), n, dtype=torch.int64, device=self.device)
+        self.extend_num_tokens = n * len(self.reqs)
+        self.seq_lens_sum = sum(seq_lens)
+
     def filter_batch(self, keep_indices: List[int]) -> "ScheduleBatch":
         out = ScheduleBatch([self.reqs[i] for i in keep_indices], self.model_runner, self.tree_cache)
         out.sampling_info = self.sampling_info.filter_batch(keep_indices)
@@ -296,4 +341,6 @@ class ScheduleBatch:
             seq_lens_cpu=list(self.seq_lens_cpu),
             sampling_info=self.sampling_info,
             batch_size=len(self.reqs),
+            reqs=self.reqs,
+            spec_num_draft=getattr(self, "spec_num_draft", 0),
         )

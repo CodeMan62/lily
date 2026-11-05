@@ -34,8 +34,10 @@ from lily.layers.linear import (
     default_weight_loader,
     MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
+from lily.layers.quantization import cuda_ops
 from lily.layers.quantization.base import QuantizationConfig
 from lily.model_executor.forward_batch_info import ForwardBatch
 from lily.models.llama import LlamaAttention, LlamaDecoderLayer, LlamaForCausalLMBase, LlamaMLP, LlamaModel
@@ -110,8 +112,18 @@ class RMSNormGated(nn.Module):
 
 
 class GatedDeltaNet(nn.Module):
-    """Qwen3.5 linear-attention block: qkv/z/b/a projections -> causal conv ->
-    gated delta rule -> RMSNormGated -> out_proj."""
+    """Qwen3.5 linear-attention block: one merged projection -> causal conv ->
+    gated delta rule -> RMSNormGated -> out_proj.
+
+    The checkpoint's four input projections (in_proj_qkv, in_proj_z, in_proj_b,
+    in_proj_a) are fused into `in_proj`, whose output columns are laid out as
+    [q | k | v | z | b | a] (per rank). The step itself runs as one fused CUDA
+    kernel when the pool says so (`pool.fused`), else as the eager reference ops.
+    """
+
+    # shard ids of the merged projection, in column order
+    SHARD_Q, SHARD_K, SHARD_V, SHARD_Z, SHARD_B, SHARD_A = range(6)
+    IN_PROJ_SHARDS = {"z": SHARD_Z, "b": SHARD_B, "a": SHARD_A}
 
     def __init__(self, config: ModelConfig, layer_id: int,
                  quant_config: Optional[QuantizationConfig] = None, prefix: str = ""):
@@ -136,18 +148,11 @@ class GatedDeltaNet(nn.Module):
         self.v_per_k = self.num_v_heads // self.num_k_heads
 
         # Merged sizes are *full*; MergedColumnParallelLinear divides by tp.
-        self.in_proj_qkv = MergedColumnParallelLinear(
-            config.hidden_size, [self.full_key_dim, self.full_key_dim, self.full_value_dim],
-            bias=False, quant_config=quant_config, prefix=f"{prefix}.in_proj_qkv")
-        self.in_proj_z = MergedColumnParallelLinear(
-            config.hidden_size, [self.full_value_dim],
-            bias=False, quant_config=quant_config, prefix=f"{prefix}.in_proj_z")
-        self.in_proj_b = MergedColumnParallelLinear(
-            config.hidden_size, [config.linear_num_value_heads],
-            bias=False, quant_config=quant_config, prefix=f"{prefix}.in_proj_b")
-        self.in_proj_a = MergedColumnParallelLinear(
-            config.hidden_size, [config.linear_num_value_heads],
-            bias=False, quant_config=quant_config, prefix=f"{prefix}.in_proj_a")
+        self.in_proj = MergedColumnParallelLinear(
+            config.hidden_size,
+            [self.full_key_dim, self.full_key_dim, self.full_value_dim, self.full_value_dim,
+             config.linear_num_value_heads, config.linear_num_value_heads],
+            bias=False, quant_config=quant_config, prefix=f"{prefix}.in_proj")
         self.out_proj = RowParallelLinear(
             self.full_value_dim, config.hidden_size,
             bias=False, quant_config=quant_config, prefix=f"{prefix}.out_proj")
@@ -159,6 +164,9 @@ class GatedDeltaNet(nn.Module):
         self.dt_bias = nn.Parameter(torch.zeros(self.num_v_heads, dtype=torch.bfloat16), requires_grad=False)
         self.dt_bias.weight_loader = lambda p, w, *a: default_weight_loader(p, w)
         self.norm = RMSNormGated(self.head_v_dim, eps=self.eps)
+        # fp32 copies for the fused kernel, made on first use (after loading)
+        self._A_log_f32: Optional[torch.Tensor] = None
+        self._dt_bias_f32: Optional[torch.Tensor] = None
 
     def _conv_loader(self, param, loaded_weight, *args) -> None:
         """conv1d.weight channels follow in_proj_qkv rows; slice per TP rank."""
@@ -180,21 +188,73 @@ class GatedDeltaNet(nn.Module):
 
     def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
         n = positions.shape[0]
-        qkv, _ = self.in_proj_qkv(hidden_states)
-        z, _ = self.in_proj_z(hidden_states)
-        b, _ = self.in_proj_b(hidden_states)
-        a, _ = self.in_proj_a(hidden_states)
-
+        proj, _ = self.in_proj(hidden_states)                 # [n, conv_dim + value_dim + 2 * nv]
         pool = forward_batch.token_to_kv_pool.mamba_pool
-        slots = forward_batch.req_pool_indices
         if pool is None:
             raise RuntimeError("hybrid model requires the mamba state pool on the forward batch")
         conv_all = pool.conv_states[self.linear_layer_idx]
         rec_all = pool.recurrent_states[self.linear_layer_idx]
+        if pool.fused:
+            out = self._forward_fused(proj, forward_batch, pool, conv_all, rec_all)
+        else:
+            out = self._forward_eager(proj, forward_batch, conv_all, rec_all, n)
+        out, _ = self.out_proj(out)
+        return out
+
+    # ---- fused CUDA path --------------------------------------------------------
+
+    def _fp32_params(self, device) -> None:
+        if self._A_log_f32 is None or self._A_log_f32.device != device:
+            self._A_log_f32 = self.A_log.data.float().contiguous()
+            self._dt_bias_f32 = self.dt_bias.data.float().contiguous()
+
+    def _forward_fused(self, proj, forward_batch, pool, conv_all, rec_all) -> torch.Tensor:
+        starts, lens, slots, fresh = forward_batch.linear_attention_meta()
+        self._fp32_params(proj.device)
+        conv_snap = rec_snap = None
+        if forward_batch.gdn_snapshot:
+            # Speculative verify: keep the pre-step states and this layer's inputs so
+            # the accepted prefix can be replayed after rejection (see replay_table_row).
+            pool.alloc_snapshots()
+            conv_snap = pool.conv_snapshots[self.linear_layer_idx]
+            rec_snap = pool.recurrent_snapshots[self.linear_layer_idx]
+            if forward_batch.gdn_proj_stash is not None:
+                forward_batch.gdn_proj_stash[self.linear_layer_idx] = proj
+        return cuda_ops.gdn_fused_forward(
+            proj, self.conv_weight_2d(), self._A_log_f32, self._dt_bias_f32, self.norm.weight.data, self.eps,
+            starts, lens, slots, fresh, conv_all, conv_all, rec_all, rec_all, conv_snap, rec_snap, self.num_k_heads)
+
+    def conv_weight_2d(self) -> torch.Tensor:
+        return self.conv1d.weight.data.view(self.conv_dim, self.conv_kernel_size)
+
+    # ---- speculative rollback (see speculative/base_worker.py) ---------------------------
+
+    def replay_supported(self, pool) -> bool:
+        return pool.fused
+
+    def replay_table_row(self, proj: torch.Tensor, pool) -> List[int]:
+        """Pointer row for `cuda_ops.gdn_fused_replay` (GDN_REPLAY_COLUMNS order):
+        replay this layer from its snapshot into the live pool over rows of `proj`."""
+        idx = self.linear_layer_idx
+        self._fp32_params(proj.device)
+        return [proj.data_ptr(), self.conv_weight_2d().data_ptr(), self._A_log_f32.data_ptr(), self._dt_bias_f32.data_ptr(),
+                pool.conv_snapshots[idx].data_ptr(), pool.conv_states[idx].data_ptr(),
+                pool.recurrent_snapshots[idx].data_ptr(), pool.recurrent_states[idx].data_ptr()]
+
+    def replay(self, table: torch.Tensor, stash, starts: torch.Tensor, lens: torch.Tensor, slots: torch.Tensor, pool) -> None:
+        """Replay every GDN layer (rows of `table`) over the accepted prefixes; `stash` is any
+        layer's stashed projection (all share one row stride)."""
+        cuda_ops.gdn_fused_replay(table, stash.stride(0), starts, lens, slots, self.num_k_heads, self.num_v_heads,
+                                  self.head_v_dim, self.conv_kernel_size, pool.dtype)
+
+    # ---- eager reference path ---------------------------------------------------
+
+    def _forward_eager(self, proj, forward_batch, conv_all, rec_all, n) -> torch.Tensor:
+        qkv, z, b, a = proj.split([self.conv_dim, self.value_dim, self.num_v_heads, self.num_v_heads], dim=-1)
+        slots = forward_batch.req_pool_indices
         w = self.conv1d.weight.data
 
-        output = torch.empty((n, self.num_v_heads, self.head_v_dim),
-                             dtype=qkv.dtype, device=qkv.device)
+        output = torch.empty((n, self.num_v_heads, self.head_v_dim), dtype=qkv.dtype, device=qkv.device)
         if forward_batch.forward_mode.is_decode():
             idx = slots.long()
             conv_state = conv_all[idx]                       # [bs, conv_dim, kernel]
@@ -212,10 +272,7 @@ class GatedDeltaNet(nn.Module):
                 starts.append(cursor)
                 cursor += ext
             decode_rows: List[int] = []
-            fresh_mask = getattr(forward_batch, "extend_seq_lens_cpu", None) is not None
             prefix_lens = forward_batch.extend_prefix_lens_cpu or [1] * len(ext_lens)
-            fresh_starts = [starts[i] for i, p in enumerate(prefix_lens) if p == 0]
-            fresh_slots = [int(slots[i]) for i, p in enumerate(prefix_lens) if p == 0]
             for i, ext_len in enumerate(ext_lens):
                 rows = slice(starts[i], starts[i] + ext_len)
                 if ext_len == 1:
@@ -240,8 +297,7 @@ class GatedDeltaNet(nn.Module):
                 output[idx] = o.to(output.dtype)
 
         out = self.norm(output.reshape(-1, self.head_v_dim), z.reshape(-1, self.head_v_dim))
-        out, _ = self.out_proj(out.reshape(n, -1))
-        return out
+        return out.reshape(n, -1)
 
     # ---- sub-paths -----------------------------------------------------------
 
@@ -279,9 +335,10 @@ class GatedDeltaNet(nn.Module):
 
 class Qwen3_5DecoderLayer(LlamaDecoderLayer):
     def __init__(self, config: ModelConfig, layer_id: int, attn_cls=None,
-                 quant_config: Optional[QuantizationConfig] = None, prefix: str = ""):
+                 quant_config: Optional[QuantizationConfig] = None, prefix: str = "",
+                 block_type: Optional[str] = None):
         nn.Module.__init__(self)
-        block_type = config.layer_types[layer_id]
+        block_type = block_type or config.layer_types[layer_id]
         self.hidden_size = config.hidden_size
         # Module attribute names match the checkpoint (`linear_attn` / `self_attn`)
         # so weight streaming needs no remapping between them.
@@ -313,13 +370,44 @@ class Qwen3_5Model(LlamaModel):
         # states; continuation chunks keep theirs. Skipped in decode mode so
         # CUDA-graph replay never bakes a zero pass in.
         pool = forward_batch.token_to_kv_pool.mamba_pool
-        if pool is None or forward_batch.extend_prefix_lens_cpu is None \
+        if pool is None or pool.fused or forward_batch.extend_prefix_lens_cpu is None \
                 or forward_batch.forward_mode.is_decode():
             return
         fresh = [i for i, p in enumerate(forward_batch.extend_prefix_lens_cpu) if p == 0]
         if fresh:
             fresh_idx = torch.tensor(fresh, dtype=torch.int64, device=positions.device)
             pool.zero_slots(forward_batch.req_pool_indices[fresh_idx])
+
+
+
+class Qwen3_5MTP(nn.Module):
+    """Qwen3.5/3.8 multi-token-prediction head (checkpoint `mtp.*`, bf16).
+
+    hidden = fc(cat(norm_e(embed(token)), norm_h(target_hidden))) -> one gated
+    full-attention decoder layer (own KV cache, layer id = num_hidden_layers) ->
+    norm. Logits come from the target's lm_head. The pair (token at position p,
+    target hidden at position p-1) sits at the draft layer's position p-1, i.e.
+    the draft cache is shifted one position left of the target's.
+    """
+
+    def __init__(self, config: ModelConfig, prefix: str = "mtp"):
+        super().__init__()
+        self.layer_id = config.num_hidden_layers
+        self.pre_fc_norm_embedding = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, zero_centered=True)
+        self.pre_fc_norm_hidden = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, zero_centered=True)
+        self.fc = ReplicatedLinear(2 * config.hidden_size, config.hidden_size)
+        self.layers = nn.ModuleList([Qwen3_5DecoderLayer(
+            config, self.layer_id, quant_config=None, prefix=f"{prefix}.layers.0", block_type="full_attention")])
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, zero_centered=True)
+
+    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor, hidden_states: torch.Tensor,
+                forward_batch: ForwardBatch, embed_tokens: nn.Module) -> torch.Tensor:
+        emb = self.pre_fc_norm_embedding(embed_tokens(input_ids))
+        hid = self.pre_fc_norm_hidden(hidden_states.to(emb.dtype))
+        x = self.fc(torch.cat([emb, hid], dim=-1))
+        h, residual = self.layers[0](positions, x, forward_batch, None)
+        h, _ = self.norm(h, residual)
+        return h
 
 
 def _rank_segments(w: torch.Tensor, n_k: int, n_v: int, hd: int, vd: int, tp_rank: int, tp_size: int):
@@ -335,9 +423,14 @@ def _rank_segments(w: torch.Tensor, n_k: int, n_v: int, hd: int, vd: int, tp_ran
 @ModelRegistry.register("Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM")
 class Qwen3_5ForCausalLM(LlamaForCausalLMBase):
     """Remaps `model.language_model.*` checkpoint names, ignores vision/MTP
-    tensors, and slices the fused `in_proj_qkv`/`conv1d` checkpoints per rank."""
+    tensors, merges the four linear-attention input projections into `in_proj`
+    and slices the fused `in_proj_qkv`/`conv1d` checkpoints per rank."""
 
     model_cls = Qwen3_5Model
+
+    def __init__(self, config: ModelConfig, quant_config: Optional[QuantizationConfig] = None, prefix: str = ""):
+        super().__init__(config, quant_config=quant_config, prefix=prefix)
+        self.mtp = Qwen3_5MTP(config) if config.enable_mtp and config.mtp_num_hidden_layers >= 1 else None
 
     def load_weights(self, weights: Iterable[tuple]) -> tuple[Set[str], Set[str]]:
         params_dict = dict(self.named_parameters())
@@ -346,13 +439,18 @@ class Qwen3_5ForCausalLM(LlamaForCausalLMBase):
         for name, loaded_weight in weights:
             if name.startswith("lm_head.") and self.config.tie_word_embeddings:
                 continue
-            if name.startswith("model.visual.") or name.startswith("mtp."):
+            if name.startswith("model.visual.") or (name.startswith("mtp.") and self.mtp is None):
                 unexpected.add(name)
                 continue
             name = name.replace("model.language_model.", "model.", 1)
 
-            # The fused in_proj_qkv / conv1d tensors are split per rank into
-            # q/k/v row segments; stacked (qkv / gate-up) entries pass a shard id.
+            # The checkpoint's in_proj_qkv / in_proj_z / in_proj_b / in_proj_a
+            # all land in the merged `in_proj`: qkv is split per rank into its
+            # q/k/v row segments (shards 0..2), z/b/a arrive pre-sliced (3..5).
+            in_proj_part = None
+            if ".linear_attn.in_proj_" in name:
+                in_proj_part = name.split(".linear_attn.in_proj_", 1)[1].split(".", 1)[0]
+                name = name.replace(f".in_proj_{in_proj_part}.", ".in_proj.", 1)
             shard_id = None
             for mapped_name, weight_name, shard_id in self.stacked_params_mapping:
                 if weight_name in name:
@@ -365,10 +463,7 @@ class Qwen3_5ForCausalLM(LlamaForCausalLMBase):
                 continue
             param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            # The fused in_proj_qkv tensor is split per rank into q/k/v row
-            # segments. conv1d must NOT go through this path: its loader slices
-            # the full checkpoint tensor per rank itself.
-            if ".in_proj_qkv." in name and ".conv1d." not in name:
+            if in_proj_part == "qkv":
                 tp_size, tp_rank = get_tp_info()
                 if loaded_weight.numel() == 1:
                     # Per-tensor quant scalar (NVFP4 weight_global_scale): the
@@ -382,6 +477,8 @@ class Qwen3_5ForCausalLM(LlamaForCausalLMBase):
                         tp_rank, tp_size)
                 for sid, partial in enumerate(segs):
                     weight_loader(param, partial, sid)
+            elif in_proj_part is not None:
+                weight_loader(param, loaded_weight, GatedDeltaNet.IN_PROJ_SHARDS[in_proj_part])
             else:
                 try:
                     if shard_id is not None:

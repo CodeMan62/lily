@@ -14,6 +14,7 @@ dependencies = [
     "uvicorn>=0.34",
     "pyzmq>=26",
     "pydantic>=2",
+    "ninja>=1.13.2",
 ]
 
 [dependency-groups]

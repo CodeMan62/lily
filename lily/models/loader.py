@@ -43,10 +43,26 @@ _KV_PROJ = ("k_proj", "v_proj")
 _QUANT_FORMAT_FACTORS = {"weight_packed": 2, "weight_scale": 16}
 
 
-def read_tp_shard(sf, name: str, num_kv_heads: int, pack_factors: Optional[dict] = None) -> torch.Tensor:
+SKIP = "skip"   # tp_plan verdict: another rank owns this tensor (expert parallelism)
+
+
+def read_tp_shard(sf, name: str, num_kv_heads: int, pack_factors: Optional[dict] = None,
+                  plan=None) -> Optional[torch.Tensor]:
+    """This rank's slice of a checkpoint tensor. With `plan(name, shape)` (a model's `tp_plan`)
+    the model decides: None = replicated, SKIP = not this rank's, (dim, start, stop) = slice.
+    Without one, the Llama-style name patterns below apply."""
     tp_size, tp_rank = get_tp_info()
     if tp_size == 1:
         return sf.get_tensor(name)
+    if plan is not None:
+        sl = sf.get_slice(name)
+        spec = plan(name, tuple(sl.get_shape()))
+        if spec is None:
+            return sf.get_tensor(name)
+        if spec == SKIP:
+            return None
+        dim, start, stop = spec
+        return sl[start:stop] if dim == 0 else sl[:, start:stop]
     if name.endswith("weight_global_scale"):  # per-tensor scalar: replicated on every rank
         return sf.get_tensor(name)
     if any(key in name for key in _ROW_PARALLEL):
@@ -68,12 +84,15 @@ def read_tp_shard(sf, name: str, num_kv_heads: int, pack_factors: Optional[dict]
         tensor[rows] if dim == 0 else tensor[:, rows])
 
 
-def safetensors_weights_iterator(model_dir: str, num_kv_heads: int, pack_factors: Optional[dict] = None) -> Iterator[Tuple[str, torch.Tensor]]:
+def safetensors_weights_iterator(model_dir: str, num_kv_heads: int, pack_factors: Optional[dict] = None,
+                                 plan=None) -> Iterator[Tuple[str, torch.Tensor]]:
     """Stream (name, tensor) pairs shard by shard, each already cut to this TP rank's slice."""
     for path in _safetensors_files(model_dir):
         with safe_open(path, framework="pt", device="cpu") as sf:
             for name in sf.keys():
-                yield name, read_tp_shard(sf, name, num_kv_heads, pack_factors)
+                t = read_tp_shard(sf, name, num_kv_heads, pack_factors, plan)
+                if t is not None:
+                    yield name, t
 
 def get_model(
     model_config: ModelConfig,
@@ -89,7 +108,7 @@ def get_model(
         model = model_cls(model_config, quant_config=quant_config)
     loaded, unexpected = model.load_weights(safetensors_weights_iterator(
         model_config.model_path, model_config.num_key_value_heads,
-        pack_factors=getattr(quant_config, "tp_pack_factors", None)))
+        pack_factors=getattr(quant_config, "tp_pack_factors", None), plan=getattr(model, "tp_plan", None)))
     missing = set(dict(model.named_parameters())) - loaded
     if unexpected:
         logger.warning("ignored %d unexpected checkpoint tensors, e.g. %s", len(unexpected), sorted(unexpected)[:5])
@@ -102,6 +121,8 @@ def get_model(
         qm = getattr(m, "quant_method", None)
         if qm is not None:
             qm.process_weights_after_loading(m)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()   # the KV pool is sized from free memory next
     model.eval()
     logger.info("loaded %s in %.1fs (%d tensors)", model_cls.__name__, time.time() - t0, len(loaded))
     return model

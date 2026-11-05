@@ -61,6 +61,12 @@ class ModelConfig:
     linear_value_head_dim: int = 0
     linear_conv_kernel_size: int = 4
     mamba_ssm_dtype: Optional[str] = None
+    # Online quantization of lm_head when the checkpoint left it in bf16 (set by ModelRunner).
+    lm_head_quantization: Optional[str] = None
+    # Multi-token-prediction head shipped in the checkpoint (Qwen3.5/3.8: one layer) and
+    # whether to build it (set by ModelRunner from --speculative-algorithm).
+    mtp_num_hidden_layers: int = 0
+    enable_mtp: bool = False
     eos_token_ids: List[int] = field(default_factory=list)
     bos_token_id: Optional[int] = None
     generation_config: Dict[str, Any] = field(default_factory=dict)
@@ -112,6 +118,12 @@ class ModelConfig:
         hf_dtype_str = text.get("torch_dtype") or text.get("dtype") or hf_config.get("torch_dtype")
         model_dtype = _resolve_dtype(dtype, hf_dtype_str)
 
+        # GLM-5.3-Flash (glm5_next) KDA layers have square heads (k dim == v dim); mapped onto the
+        # linear_* fields so the state pool sizing and the hybrid plumbing are shared with Qwen3.5.
+        kda = text.get("linear_attn_config") or {}
+        kda_heads = text.get("linear_num_heads") or kda.get("num_heads") or 0
+        kda_head_dim = text.get("linear_head_dim") or kda.get("head_dim") or 0
+
         max_pos = text.get("max_position_embeddings", 4096)
         if rope_scaling and rope_scaling.get("rope_type") == "yarn":
             factor = rope_scaling.get("factor", 1.0)
@@ -143,12 +155,14 @@ class ModelConfig:
             attention_bias=bool(text.get("attention_bias", False)),
             layer_types=text.get("layer_types"),
             quantization_config=hf_config.get("quantization_config") or text.get("quantization_config"),
-            linear_num_key_heads=text.get("linear_num_key_heads", 0),
-            linear_num_value_heads=text.get("linear_num_value_heads", 0),
-            linear_key_head_dim=text.get("linear_key_head_dim", 0),
-            linear_value_head_dim=text.get("linear_value_head_dim", 0),
-            linear_conv_kernel_size=text.get("linear_conv_kernel_dim", 4),
+            linear_num_key_heads=text.get("linear_num_key_heads", kda_heads),
+            linear_num_value_heads=text.get("linear_num_value_heads", kda_heads),
+            linear_key_head_dim=text.get("linear_key_head_dim", kda_head_dim),
+            linear_value_head_dim=text.get("linear_value_head_dim", kda_head_dim),
+            linear_conv_kernel_size=text.get("linear_conv_kernel_dim", kda.get("short_conv_kernel_size", 4)),
             mamba_ssm_dtype=text.get("mamba_ssm_dtype"),
+            mtp_num_hidden_layers=int(text.get("mtp_num_hidden_layers") or hf_config.get("mtp_num_hidden_layers")
+                                      or text.get("num_nextn_predict_layers") or 0),
             eos_token_ids=eos_ids,
             bos_token_id=text.get("bos_token_id"),
             generation_config=generation_config,

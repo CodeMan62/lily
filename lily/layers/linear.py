@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from lily.distributed import get_tp_info, tensor_model_parallel_all_reduce
@@ -31,6 +32,18 @@ def _broadcast_scalar(loaded_weight: torch.Tensor, size: int) -> torch.Tensor:
     if loaded_weight.numel() == 1 and size != 1:
         return loaded_weight.reshape(1).expand(size)
     return loaded_weight
+
+
+class ReplicatedLinear(nn.Module):
+    """Plain linear without bias, same weights on every rank (checkpoint-dtype bf16 by default):
+    the small projections of GLM-5.3-Flash attention, the MTP heads, the DFlash drafter."""
+
+    def __init__(self, in_features: int, out_features: int, dtype: torch.dtype = torch.bfloat16):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype), requires_grad=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.linear(x, self.weight)
 
 
 class LinearBase(nn.Module):
@@ -129,14 +142,18 @@ class QKVParallelLinear(LinearBase):
 
 
 class RowParallelLinear(LinearBase):
-    """Input dim split across TP ranks (o_proj, down_proj); partial outputs are all-reduced."""
+    """Input dim split across TP ranks (o_proj, down_proj); partial outputs are all-reduced
+    unless `reduce_results=False` (the caller folds them into one later all-reduce)."""
 
-    def __init__(self, input_size: int, output_size: int, bias: bool, **kw):
+    def __init__(self, input_size: int, output_size: int, bias: bool, reduce_results: bool = True, **kw):
         tp_size, _ = get_tp_info()
+        self.reduce_results = reduce_results
         super().__init__(input_size // tp_size, output_size, bias, **kw)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        out = tensor_model_parallel_all_reduce(self.quant_method.apply(self, x))
+        out = self.quant_method.apply(self, x)
+        if self.reduce_results:
+            out = tensor_model_parallel_all_reduce(out)
         # Bias is replicated, so add it once after the reduce.
         if self.bias is not None and not self.skip_bias_add:
             out = out + self.bias

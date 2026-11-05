@@ -45,23 +45,53 @@ class VocabParallelEmbedding(nn.Module):
 
 
 class ParallelLMHead(VocabParallelEmbedding):
-    """Output projection, applied via `compute_logits`; never called directly."""
+    """Output projection, applied via `compute_logits`; never called directly.
 
-    def __init__(self, num_embeddings: int, embedding_dim: int, bias: bool = False, params_dtype: Optional[torch.dtype] = None, prefix: str = ""):
+    With a `quant_method` (checkpoint-quantized `lm_head.weight_packed`, or
+    online `--quantize-lm-head`) the projection runs through the quantized
+    linear path: on a 248k vocab that is a 0.72 GB read per token instead of
+    2.5 GB in bf16.
+    """
+
+    def __init__(self, num_embeddings: int, embedding_dim: int, bias: bool = False, params_dtype: Optional[torch.dtype] = None,
+                 prefix: str = "", quant_method=None):
         super().__init__(num_embeddings, embedding_dim, params_dtype, prefix)
+        self.quant_method = quant_method
+        if quant_method is not None:
+            # Replace the bf16 table with the method's storage (vocab rows per rank).
+            self._parameters.pop("weight", None)
+            self.input_size = embedding_dim
+            quant_method.create_weights(self, embedding_dim, self.num_embeddings_per_partition, params_dtype or torch.get_default_dtype())
+            for param in self._parameters.values():
+                param.weight_loader = self.quant_weight_loader  # type: ignore[attr-defined]
         if bias:
-            self.bias = nn.Parameter(torch.zeros(self.num_embeddings_per_partition, dtype=self.weight.dtype), requires_grad=False)
+            self.bias = nn.Parameter(torch.zeros(self.num_embeddings_per_partition, dtype=params_dtype or torch.get_default_dtype()), requires_grad=False)
             self.bias.weight_loader = self.weight_loader  # type: ignore[attr-defined]
         else:
             self.register_parameter("bias", None)
 
+    def quant_weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor, *args) -> None:
+        """Rows are vocab entries (zero-padded like the embedding); a [1] tensor is a per-tensor scale."""
+        if loaded_weight.numel() == 1 and param.numel() != 1:
+            param.data.fill_(loaded_weight.reshape(()).item())
+            return
+        n = loaded_weight.shape[0]
+        assert n <= param.shape[0] and loaded_weight.shape[1:] == param.shape[1:], (loaded_weight.shape, param.shape)
+        param.data[:n].copy_(loaded_weight)
+        if n < param.shape[0]:
+            param.data[n:].zero_()
+
     def tie_weights(self, embed_tokens: VocabParallelEmbedding) -> "ParallelLMHead":
+        assert self.quant_method is None, "a tied lm_head shares the embedding table and cannot be quantized separately"
         self.weight = embed_tokens.weight
         return self
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """[n, hidden] -> [n, vocab] float32, full vocab on every rank."""
-        logits = F.linear(hidden_states, self.weight, self.bias)
+        if self.quant_method is not None:
+            logits = self.quant_method.apply(self, hidden_states, self.bias)
+        else:
+            logits = F.linear(hidden_states, self.weight, self.bias)
         logits = tensor_model_parallel_all_gather(logits, dim=-1)
         return logits[:, : self.num_embeddings].float()
 

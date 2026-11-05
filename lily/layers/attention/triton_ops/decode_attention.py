@@ -74,9 +74,9 @@ def _fwd_kernel_stage1(
             k = tl.load(K_Buffer + offs_buf_k, mask=mask_n[None, :] & mask_d[:, None], other=0.0)
 
             if IEEE:
-                qk = tl.dot(q.to(k.dtype), k, input_precision="ieee")
+                qk = tl.dot(q, k.to(q.dtype), input_precision="ieee")
             else:
-                qk = tl.dot(q.to(k.dtype), k)
+                qk = tl.dot(q, k.to(q.dtype))
             qk *= sm_scale
             qk = tl.where(mask_h[:, None] & mask_n[None, :], qk, float("-inf"))
 
@@ -88,9 +88,9 @@ def _fwd_kernel_stage1(
             p = tl.exp(qk - n_e_max[:, None])
             acc *= re_scale[:, None]
             if IEEE:
-                acc += tl.dot(p.to(v.dtype), v, input_precision="ieee")
+                acc += tl.dot(p.to(q.dtype), v.to(q.dtype), input_precision="ieee")
             else:
-                acc += tl.dot(p.to(v.dtype), v)
+                acc += tl.dot(p.to(q.dtype), v.to(q.dtype))
             e_sum = e_sum * re_scale + tl.sum(p, 1)
             e_max = n_e_max
 

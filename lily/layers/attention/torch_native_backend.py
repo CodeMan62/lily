@@ -18,9 +18,9 @@ if TYPE_CHECKING:
 
 
 class TorchNativeAttnBackend(AttentionBackend):
-    def __init__(self, model_runner: "ModelRunner"):
+    def __init__(self, model_runner: "ModelRunner", kv_pool=None):
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
-        self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.token_to_kv_pool = kv_pool or model_runner.token_to_kv_pool
 
     def supports_cuda_graph(self) -> bool:
         # Data-dependent shapes (python loop over the batch, dynamic masks)

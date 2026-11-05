@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 
@@ -29,6 +29,42 @@ class _StaticDecodeBuffers:
     out_cache_loc: torch.Tensor
 
 
+def capture_buckets(max_bs: int, configured: Optional[List[int]]) -> List[int]:
+    """Batch sizes to capture: the configured list, else powers of two up to `max_bs`."""
+    if configured:
+        values = sorted({int(x) for x in configured if 0 < int(x) <= max_bs})
+        if max_bs not in values:
+            values.append(max_bs)
+        return sorted(set(values))
+    values: List[int] = []
+    bs = 1
+    while bs < max_bs:
+        values.append(bs)
+        bs *= 2
+    values.append(max_bs)
+    return sorted(set(values))
+
+
+def seq_len_fill(backend) -> int:
+    """Padding sequence length during capture (1 for models running their own attention)."""
+    return backend.get_cuda_graph_seq_len_fill_value() if backend is not None else 1
+
+
+def warmup_and_capture(fn):
+    """Run `fn` twice on a side stream (Triton autotune, lazy allocations), then capture it."""
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(2):
+            fn()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    torch.cuda.synchronize()
+    with torch.cuda.graph(graph):
+        out = fn()
+    return graph, out
+
+
 class CudaGraphRunner:
     def __init__(self, model_runner):
         if not torch.cuda.is_available():
@@ -40,31 +76,24 @@ class CudaGraphRunner:
         if configured_max is None:
             configured_max = min(model_runner.max_running_requests, 16)
         self.max_bs = max(1, int(configured_max))
-        self.capture_bs = self._get_capture_bs(args.cuda_graph_bs)
+        self.capture_bs = capture_buckets(self.max_bs, args.cuda_graph_bs)
         self.graphs: Dict[int, torch.cuda.CUDAGraph] = {}
         self.buffers: Dict[int, _StaticDecodeBuffers] = {}
         self.outputs: Dict[int, object] = {}
+        # The captured ForwardBatch must outlive capture: layers cache small device tensors on it
+        # (e.g. gdn_meta) that the graph reads by address; dropping it would free them for reuse.
+        self.forward_batches: Dict[int, ForwardBatch] = {}
         self._captured = False
 
-        backend = model_runner.attn_backend
-        if not getattr(backend, "supports_cuda_graph", lambda: True)():
-            raise RuntimeError(f"{type(backend).__name__} does not support CUDA graphs")
-        backend.init_cuda_graph_state(self.max_bs, self.max_bs)
+        backend = model_runner.attn_backend      # None for models that run their own attention
+        if backend is not None:
+            if not getattr(backend, "supports_cuda_graph", lambda: True)():
+                raise RuntimeError(f"{type(backend).__name__} does not support CUDA graphs")
+            backend.init_cuda_graph_state(self.max_bs, self.max_bs)
         self.capture()
 
-    def _get_capture_bs(self, configured: List[int] | None) -> List[int]:
-        if configured:
-            values = sorted({int(x) for x in configured if 0 < int(x) <= self.max_bs})
-            if self.max_bs not in values:
-                values.append(self.max_bs)
-            return values
-        values: List[int] = []
-        bs = 1
-        while bs < self.max_bs:
-            values.append(bs)
-            bs *= 2
-        values.append(self.max_bs)
-        return sorted(set(values))
+    def _seq_len_fill(self) -> int:
+        return seq_len_fill(self.model_runner.attn_backend)
 
     def _bucket(self, batch_size: int) -> int:
         for bs in self.capture_bs:
@@ -73,7 +102,7 @@ class CudaGraphRunner:
         raise ValueError(f"decode batch size {batch_size} exceeds cuda graph max {self.max_bs}")
 
     def _make_buffers(self, bs: int) -> _StaticDecodeBuffers:
-        fill = self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
+        fill = self._seq_len_fill()
         return _StaticDecodeBuffers(
             input_ids=torch.zeros(bs, dtype=torch.int64, device=self.device),
             positions=torch.zeros(bs, dtype=torch.int64, device=self.device),
@@ -91,11 +120,12 @@ class CudaGraphRunner:
             seq_lens=buffers.seq_lens,
             positions=buffers.positions,
             out_cache_loc=buffers.out_cache_loc,
-            seq_lens_cpu=[self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()] * bs,
+            seq_lens_cpu=[self._seq_len_fill()] * bs,
             seq_lens_sum=bs,
             attn_backend=self.model_runner.attn_backend,
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
+            capture_hidden_states=True,
         )
 
     @torch.inference_mode()
@@ -103,28 +133,15 @@ class CudaGraphRunner:
         buffers = self._make_buffers(bs)
         forward_batch = self._make_forward_batch(buffers, bs)
         backend = self.model_runner.attn_backend
-        backend.init_forward_metadata_capture_cuda_graph(bs, buffers.req_pool_indices, buffers.seq_lens)
+        if backend is not None:
+            backend.init_forward_metadata_capture_cuda_graph(bs, buffers.req_pool_indices, buffers.seq_lens)
 
-        # Warm up on a side stream so Triton autotuning and lazy CUDA allocations
-        # happen before capture.
-        warmup_stream = torch.cuda.Stream(device=self.device)
-        warmup_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(warmup_stream):
-            for _ in range(2):
-                self.model_runner.model(
-                    buffers.input_ids, buffers.positions, forward_batch
-                )
-        torch.cuda.current_stream().wait_stream(warmup_stream)
-
-        graph = torch.cuda.CUDAGraph()
-        torch.cuda.synchronize(self.device)
-        with torch.cuda.graph(graph):
-            output = self.model_runner.model(
-                buffers.input_ids, buffers.positions, forward_batch
-            )
+        graph, output = warmup_and_capture(
+            lambda: self.model_runner.model(buffers.input_ids, buffers.positions, forward_batch))
         self.graphs[bs] = graph
         self.buffers[bs] = buffers
         self.outputs[bs] = output
+        self.forward_batches[bs] = forward_batch
         logger.debug("captured decode CUDA graph bs=%d", bs)
 
     def capture(self) -> None:
@@ -138,6 +155,7 @@ class CudaGraphRunner:
             self._captured
             and forward_batch.forward_mode.is_decode()
             and 0 < forward_batch.batch_size <= self.max_bs
+            and getattr(self.model_runner.model, "can_run_cuda_graph", lambda fb: True)(forward_batch)
         )
 
     @torch.inference_mode()
@@ -154,11 +172,15 @@ class CudaGraphRunner:
         buffers.seq_lens[:bs].copy_(forward_batch.seq_lens)
         buffers.out_cache_loc[:bs].copy_(forward_batch.out_cache_loc)
 
-        self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
-            bucket, buffers.req_pool_indices, buffers.seq_lens
-        )
+        if self.model_runner.attn_backend is not None:
+            self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
+                bucket, buffers.req_pool_indices, buffers.seq_lens
+            )
         self.graphs[bucket].replay()
         captured = self.outputs[bucket]
         # Return a view over the graph-owned logits buffer; the padded rows are
         # discarded. The view is consumed before the next replay overwrites it.
-        return LogitsProcessorOutput(next_token_logits=captured.next_token_logits[:bs])
+        return LogitsProcessorOutput(next_token_logits=captured.next_token_logits[:bs],
+                                     hidden_states=captured.hidden_states[:bs],
+                                     aux_hidden_states=captured.aux_hidden_states[:bs]
+                                     if captured.aux_hidden_states is not None else None)

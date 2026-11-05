@@ -67,6 +67,51 @@ class ForwardBatch:
     req_to_token_pool: Any = None
     token_to_kv_pool: Any = None
 
+    # Hybrid (Gated DeltaNet) layers: (cu_seqlens int32 [bs+1], slots int64 [bs],
+    # fresh uint8 [bs] | None), built by the first linear-attention layer and
+    # shared by the rest. `gdn_snapshot` asks the fused kernel to keep a copy of
+    # the pre-step states (speculative verify rollback).
+    gdn_meta: Any = None
+    gdn_snapshot: bool = False
+    # With gdn_snapshot: each linear-attention layer stores its merged projection here
+    # (list indexed by linear layer index) so the accepted prefix can be replayed.
+    gdn_proj_stash: Optional[List[Any]] = None
+    # Speculative decoding: logits for every token (verify) and/or the final hidden
+    # states for every token (draft-head inputs).
+    return_all_logits: bool = False
+    capture_hidden_states: bool = False
+    # Residual stream after these layer ids, concatenated per token (DFlash drafter context).
+    capture_aux_layers: Optional[List[int]] = None
+    aux_hidden_states: Any = None   # filled by the model when capture_aux_layers is set
+    # Graph-captured fixed-shape extend (speculative verify): preallocated attention
+    # metadata buffers {kv_indptr, kv_indices, qo_indptr} so no host sync is needed.
+    graph_static: Any = None
+
+    def linear_attention_meta(self):
+        """(tok_starts int32 [bs], tok_lens int32 [bs], slots int64 [bs], fresh uint8 [bs] | None) for the
+        fused linear-attention kernels (GDN, KDA); built once per batch and cached in `gdn_meta`."""
+        if self.gdn_meta is not None:
+            return self.gdn_meta
+        device = self.req_pool_indices.device
+        bs = self.batch_size
+        slots = self.req_pool_indices if self.req_pool_indices.dtype is torch.int64 else self.req_pool_indices.long()
+        if self.forward_mode.is_decode():
+            starts = torch.arange(bs, dtype=torch.int32, device=device)
+            lens = torch.ones(bs, dtype=torch.int32, device=device)
+            fresh = None
+        else:
+            lens_cpu = self.extend_seq_lens_cpu
+            starts_cpu = [0]
+            for L in lens_cpu[:-1]:
+                starts_cpu.append(starts_cpu[-1] + L)
+            starts = torch.tensor(starts_cpu, dtype=torch.int32, device=device)
+            lens = torch.tensor(lens_cpu, dtype=torch.int32, device=device)
+            prefix = self.extend_prefix_lens_cpu or [1] * len(lens_cpu)
+            fresh = torch.tensor([int(p == 0) for p in prefix], dtype=torch.uint8, device=device) \
+                if any(p == 0 for p in prefix) else None
+        self.gdn_meta = (starts, lens, slots.contiguous(), fresh)
+        return self.gdn_meta
+
     @classmethod
     def init_new(cls, model_worker_batch: Any, model_runner: Any) -> "ForwardBatch":
         return cls(

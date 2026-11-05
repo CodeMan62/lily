@@ -69,10 +69,14 @@ class PrefillAdder:
 
 @dataclass
 class GenerationBatchResult:
-    logits_output: LogitsProcessorOutput
-    next_token_ids: torch.Tensor
+    logits_output: Optional[LogitsProcessorOutput]
+    next_token_ids: Optional[torch.Tensor]
     sampler_output: Optional[SamplerOutput] = None
     copy_done: Optional[torch.cuda.Event] = None
+    # Speculative round: committed tokens per request (variable length) and the
+    # number of verify slots that were allocated per request.
+    accepted: Optional[List[List[int]]] = None
+    spec_slots: int = 0
 
 
 class TpModelWorker:
@@ -85,6 +89,11 @@ class TpModelWorker:
     def __init__(self, model_config, server_args, device: str = "cuda", tp_rank: int = 0):
         self.model_runner = ModelRunner(model_config, server_args, device=device, tp_rank=tp_rank)
         self.sampler = Sampler()
+        self.spec = None
+        if server_args.speculative_algorithm is not None:
+            from lily.speculative.base_worker import build_spec_worker
+
+            self.spec = build_spec_worker(self.model_runner, server_args)
 
     def _sync_token_ids(self, next_token_ids: torch.Tensor) -> torch.Tensor:
         # Logits are identical on every rank, but sampling RNG is per-process;
@@ -93,15 +102,33 @@ class TpModelWorker:
 
     @torch.inference_mode()
     def forward_batch_generation(self, model_worker_batch) -> GenerationBatchResult:
+        if self.spec is not None and model_worker_batch.forward_mode.is_decode():
+            return self._spec_round(model_worker_batch)
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+        if self.spec is not None:
+            forward_batch.capture_hidden_states = True   # the draft head needs the prompt's hidden states
+            forward_batch.capture_aux_layers = self.spec.aux_layers
         logits_output = self.model_runner.forward(forward_batch)
         sampling_info = model_worker_batch.sampling_info
         if sampling_info is None or len(sampling_info) == 0:
-            next_token_ids = torch.argmax(logits_output.next_token_logits, dim=-1)
-            return GenerationBatchResult(logits_output, self._sync_token_ids(next_token_ids))
-        sampler_output = self.sampler(logits_output.next_token_logits, sampling_info)
-        sampler_output.next_token_ids = self._sync_token_ids(sampler_output.next_token_ids)
-        return GenerationBatchResult(logits_output, sampler_output.next_token_ids, sampler_output)
+            next_token_ids = self._sync_token_ids(torch.argmax(logits_output.next_token_logits, dim=-1))
+            result = GenerationBatchResult(logits_output, next_token_ids)
+        else:
+            sampler_output = self.sampler(logits_output.next_token_logits, sampling_info)
+            sampler_output.next_token_ids = self._sync_token_ids(sampler_output.next_token_ids)
+            result = GenerationBatchResult(logits_output, sampler_output.next_token_ids, sampler_output)
+        if self.spec is not None:
+            self.spec.init_after_extend(model_worker_batch.reqs, model_worker_batch, logits_output, result.next_token_ids)
+        return result
+
+    def _spec_round(self, model_worker_batch) -> GenerationBatchResult:
+        res = self.spec.decode_round(model_worker_batch.reqs, model_worker_batch, self.sampler)
+        if self.spec.rounds % 200 == 0:
+            logger.info("speculative decoding: %d rounds, mean accepted length %.2f tokens/round (k=%d)",
+                        self.spec.rounds, self.spec.acceptance_length(), self.spec.k)
+        # Ranks agree on the committed tokens: rank 0's acceptance is authoritative.
+        accepted = broadcast_pyobj(res.accepted, self.model_runner.tp_rank, src=0)
+        return GenerationBatchResult(None, None, res.sampler_output, accepted=accepted, spec_slots=res.num_draft + 1)
 
 
 @dataclass
@@ -152,6 +179,11 @@ class Scheduler:
         self.max_running_requests = self.model_runner.max_running_requests
         self.chunked_prefill_size = server_args.chunked_prefill_size
         self.prefill_token_budget = server_args.max_prefill_tokens
+        # Speculative decoding: draft tokens per round (0 = off). Prefill and decode
+        # run as separate batches and overlap scheduling stays off.
+        # (the runner may have adjusted num_steps to the drafter's block size)
+        self.spec_k = int(server_args.speculative_num_steps or 0) if server_args.speculative_algorithm else 0
+        self.spec_on = server_args.speculative_algorithm is not None
 
         self._requests: Dict[str, _RequestItem] = {}
         self.prefill_tokens_computed = 0
@@ -160,6 +192,7 @@ class Scheduler:
         # ---- overlap scheduling (Phase 7) ---------------------------------
         self.enable_overlap = (
             not server_args.disable_overlap_schedule
+            and not self.spec_on
             and self.device.type == "cuda"
             and torch.cuda.is_available()
         )
@@ -334,24 +367,41 @@ class Scheduler:
                 batch = batch.filter_batch(keep)
                 if not batch.reqs:
                     return None
-        need = len(batch.reqs)
+        k = self._spec_draft_count(batch) if self.spec_on else 0
+        need = len(batch.reqs) * (k + 1)
         if self.token_to_kv_pool_allocator.available_size() < need:
             deficit = need - self.token_to_kv_pool_allocator.available_size()
             self.tree_cache.evict(deficit)
         if self.token_to_kv_pool_allocator.available_size() < need:
-            batch = self.retract_decode(batch)
+            batch = self.retract_decode(batch, k + 1)
             if batch is None or not batch.reqs:
                 return None
-        batch.prepare_for_decode(future_token_ids)
+        if self.spec_on:
+            batch.prepare_for_spec_decode(k)
+        else:
+            batch.prepare_for_decode(future_token_ids)
         return batch
 
-    def retract_decode(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
+    def _spec_draft_count(self, batch: ScheduleBatch) -> int:
+        """Drafts this round: the configured k, or 0 when a request needs the plain
+        sampler (penalties, logprobs) or has no draft state yet."""
+        from lily.speculative.base_worker import needs_plain_sampler
+
+        if self.spec_k <= 0:
+            return 0
+        for r in batch.reqs:
+            if not self.worker.spec.ready(r) or needs_plain_sampler(r.sampling_params):
+                return 0
+        return self.spec_k
+
+    def retract_decode(self, batch: ScheduleBatch, slots_per_req: int = 1) -> Optional[ScheduleBatch]:
         """Evict the youngest requests back to the waiting queue until a decode fits."""
         keep: List[Req] = list(batch.reqs)
-        while keep and self.token_to_kv_pool_allocator.available_size() < len(keep):
+        while keep and self.token_to_kv_pool_allocator.available_size() < len(keep) * slots_per_req:
             req = keep.pop()
             self._free_req_kv(req)
             self._free_req_slot(req)
+            req.clear_spec_state()
             req.prefix_indices = None
             req.last_node = None
             req.tree_prefix_len = 0
@@ -366,6 +416,17 @@ class Scheduler:
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         running = self.running_batch
+        if self.spec_on:
+            # Speculative rounds and prefills are separate batches: a waiting prefill
+            # runs first (the running requests keep their state and go next step).
+            new_batch = self._get_new_prefill_batch()
+            if new_batch is not None and new_batch.reqs:
+                self._batch_overlap = False
+                return new_batch
+            if running is None or not running.reqs:
+                return None
+            self.running_batch = running = self._prepare_decode_batch(running)
+            return running
         running_overlap = self._use_overlap_for(running)
         future_ids = self.future_token_ids if running_overlap else None
         if running is not None and running.reqs:
@@ -387,7 +448,8 @@ class Scheduler:
 
     def run_batch(self, batch: ScheduleBatch):
         if batch.forward_mode.is_decode():
-            self.decode_steps += len(batch.reqs)
+            if not self.spec_on:
+                self.decode_steps += len(batch.reqs)
         else:
             self.prefill_tokens_computed += batch.extend_num_tokens - batch.num_decode_reqs
         return self.worker.forward_batch_generation(batch.get_model_worker_batch())
@@ -493,6 +555,10 @@ class Scheduler:
             self.process_batch_result_decode(batch, result, 0, split, running)
         if split < len(batch.reqs):
             self.process_batch_result_prefill(batch, result, split, len(batch.reqs), running)
+        if self.spec_on and self.running_batch is not None:
+            # prefill batches run alone: keep the requests that were not in this batch
+            in_batch = {id(r) for r in batch.reqs}
+            running = [r for r in self.running_batch.reqs if id(r) not in in_batch] + running
         self.running_batch = (
             ScheduleBatch(running, self.model_runner, self.tree_cache) if running else None
         )
@@ -513,9 +579,36 @@ class Scheduler:
             self._append_token(req, int(next_token_ids[i]), running, result, i)
 
     def process_batch_result_decode(self, batch, result, lo: int, hi: int, running: List[Req]) -> None:
+        if result.accepted is not None:
+            self._process_spec_result(batch, result, running)
+            return
         next_token_ids = result.next_token_ids
         for i in range(lo, hi):
             self._append_token(batch.reqs[i], int(next_token_ids[i]), running, result, i)
+
+    def _process_spec_result(self, batch, result, running: List[Req]) -> None:
+        """Commit each request's accepted run (stopping at EOS / max tokens), advance its
+        cached length by the inputs it consumed, and free the unused verify slots."""
+        n = result.spec_slots
+        for i, req in enumerate(batch.reqs):
+            committed = 0
+            for tok in result.accepted[i]:
+                self._append_token(req, tok, [], result, i)   # emits, checks stop conditions
+                committed += 1
+                if req.finished:
+                    break
+            # Inputs now cached: the previous tail token plus committed-1 accepted
+            # drafts, i.e. `committed` of the n verify slots; the rest go back.
+            start = req.seq_len
+            if committed < n:
+                unused = self.req_to_token[req.req_pool_idx, start + committed:start + n]
+                self.token_to_kv_pool_allocator.free(unused.long().clone())
+            req.seq_len = start + committed
+            if req.finished:
+                self.cache_finished_req(req)
+            else:
+                running.append(req)
+        self.decode_steps += len(batch.reqs)
 
     def _append_token(self, req: Req, token: int, running: List[Req], result=None, index: int = 0) -> None:
         req.output_ids.append(token)
@@ -532,6 +625,8 @@ class Scheduler:
             if req.lookahead > 0:
                 req.pending_free = True
                 self._finish(req)
+            elif result is not None and result.accepted is not None:
+                self._finish(req)   # the spec path frees KV once seq_len is settled
             else:
                 self.cache_finished_req(req)
                 self._finish(req)
@@ -634,6 +729,10 @@ def run_scheduler_process(
     stop_event: Optional[threading.Event] = None,
     tp_rank: int = 0,
 ) -> None:
+    # Spawned process: the launcher's logging config is not inherited, so without this only
+    # warnings reach the server log (no load / memory / "scheduler ready" lines).
+    logging.basicConfig(level=getattr(logging, str(getattr(server_args, "log_level", "info")).upper(), logging.INFO),
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s", force=True)
     # Only rank 0 is wired to the tokenizer/detokenizer; the other ranks get
     # their inputs from rank 0's broadcast each iteration.
     context = zmq.Context()

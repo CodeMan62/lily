@@ -28,6 +28,9 @@ _CHECKPOINT_METHODS = {
         "nvfp4-pack-quantized": NVFP4Config,
         "pack-quantized": CompressedInt4Config,
     },
+    # NVIDIA ModelOpt exports (e.g. nvidia/GLM-5.3-Flash-NVFP4): same NVFP4 layout, tensors named
+    # weight / weight_scale / weight_scale_2 (remapped by the model loaders), keyed by `quant_algo`.
+    "modelopt": {"NVFP4": NVFP4Config},
 }
 
 
@@ -46,7 +49,7 @@ def build_quant_config(quantization: Optional[str], model_config=None) -> Option
     if checkpoint_cfg:
         method = checkpoint_cfg.get("quant_method", "unknown")
         formats = _CHECKPOINT_METHODS.get(method, {})
-        fmt = checkpoint_cfg.get("format")
+        fmt = checkpoint_cfg.get("format") or checkpoint_cfg.get("quant_algo")
         cls = formats.get(fmt)
         if cls is None:
             raise NotImplementedError(
