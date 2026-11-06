@@ -4,7 +4,6 @@
     modal run scripts/modal_glm5.py::check_load   # CPU only: one rank's slice loads with 0 missing params
     modal run scripts/modal_glm5.py::bench        # 4x RTX PRO 6000 ($3.03/h each): serve, check one
                                                   # reply, measure tok/s at concurrency 1 and 8, exit
-    modal run scripts/modal_glm5.py::profile      # 4x RTX PRO 6000: per-kernel decode step breakdown
     modal run scripts/modal_glm5.py::test         # 2x RTX PRO 6000: the GLM test suite on tiny models
 
 The image compiles lily's CUDA kernels for sm_120 at build time (CPU, no GPU billed), so the GPU
@@ -36,8 +35,7 @@ PORT = 30000
 app = modal.App("lily-glm53-flash")
 vol = modal.Volume.from_name("lily-models", create_if_missing=True)
 
-build_env = {"LILY_SPEC_TIMING": os.environ.get("LILY_SPEC_TIMING", ""), "LILY_SCHED_PROFILE": os.environ.get("LILY_SCHED_PROFILE", "0"),
-             "TORCH_CUDA_ARCH_LIST": "12.0", "LILY_CUDA_BUILD_DIR": "/opt/lily-cuda", "CUDA_HOME": "/usr/local/cuda",
+build_env = {"TORCH_CUDA_ARCH_LIST": "12.0", "LILY_CUDA_BUILD_DIR": "/opt/lily-cuda", "CUDA_HOME": "/usr/local/cuda",
              "TOKENIZERS_PARALLELISM": "false"}
 
 image = (
@@ -160,7 +158,7 @@ def _real_prompts() -> list:
 
 
 @app.function(image=image, volumes={"/models": vol}, gpu=GPU, cpu=16, memory=65536, timeout=20 * 60)
-def lossless(spec: str = "dflash", output_len: int = 256) -> None:
+def lossless(spec: str = "dflash", output_len: int = 256, k: int = 5) -> None:
     """Greedy speculative output vs the target's own argmax, with a plain run as the noise floor."""
     import httpx
 
@@ -169,7 +167,7 @@ def lossless(spec: str = "dflash", output_len: int = 256) -> None:
     runs = {}
     for name in ("plain", spec):
         t0 = time.time()
-        proc = _start_server("" if name == "plain" else spec, f"/tmp/lily-{name}.log", t0)
+        proc = _start_server("" if name == "plain" else spec, f"/tmp/lily-{name}.log", t0, k)
         try:
             _wait_ready(proc, base, f"/tmp/lily-{name}.log", t0, 12 * 60)
             pairs = []
@@ -261,12 +259,6 @@ def bench(input_len: int = 256, output_len: int = 256, concurrency: str = "1,8",
             print(f"could not save results: {exc}", flush=True)
     return result
 
-
-
-@app.function(image=image, volumes={"/models": vol}, gpu=GPU, cpu=16, memory=65536, timeout=15 * 60)
-def profile(bs: int = 1, verify: int = 7, server_args: str = "{}") -> None:
-    subprocess.run([sys.executable, "/app/bench/profile_decode.py", "--model-path", MODEL_DIR, "--tp", "4", "--bs", str(bs),
-                    "--verify", str(verify), "--server-args", server_args], check=True)
 
 
 @app.function(image=image, gpu="RTX-PRO-6000:2", cpu=8, memory=32768, timeout=15 * 60)

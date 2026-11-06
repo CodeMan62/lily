@@ -5,6 +5,7 @@
 // contiguous bytes per row and they feed two k16 steps, no shared memory on the way to the MMA.
 // Block = 16 weight rows; its 8 warps split K in 128-wide pieces and reduce through shared memory.
 #include <torch/extension.h>
+#include <c10/cuda/CUDAException.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
@@ -33,10 +34,19 @@ __device__ __forceinline__ uint4 load_stream(const void* p) {     // weights: re
     return v;
 }
 
+// Activations come from the previous kernel. Volatile, so it stays after griddepcontrol.wait: a plain
+// read through a const __restrict__ pointer may be hoisted above it, even past a memory clobber.
+__device__ __forceinline__ uint4 load_after_wait(const void* p) {
+    uint4 v;
+    asm volatile("ld.global.v4.u32 {%0,%1,%2,%3}, [%4];\n" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p) : "memory");
+    return v;
+}
+
 __global__ void __launch_bounds__(THREADS)
 bf16_skinny_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ out,
                    int M, int N, int K, int ldx) {
     __shared__ float red[WARPS][ROWS][MAX_M];
+    asm volatile("griddepcontrol.launch_dependents;");
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int n0 = blockIdx.x * ROWS;
     const int ra = min(n0 + g, N - 1), rb = min(n0 + g + 8, N - 1);
@@ -52,7 +62,13 @@ bf16_skinny_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __r
             const int k = k0 + 32 * u + 8 * t;
             a[u] = load_stream(wa + k);
             b[u] = load_stream(wb + k);
-            v[u] = valid ? *reinterpret_cast<const uint4*>(xr + k) : make_uint4(0u, 0u, 0u, 0u);
+        }
+        // weights do not depend on the previous kernel, the activations do
+        if (k0 == warp * K_PIECE) asm volatile("griddepcontrol.wait;" ::: "memory");
+#pragma unroll
+        for (int u = 0; u < UNROLL; ++u) {
+            const int k = k0 + 32 * u + 8 * t;
+            v[u] = valid ? load_after_wait(xr + k) : make_uint4(0u, 0u, 0u, 0u);
         }
 #pragma unroll
         for (int u = 0; u < UNROLL; ++u) {
@@ -75,57 +91,15 @@ bf16_skinny_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __r
     }
 }
 
-// Router logits, fp32 like the reference: one block per expert, the fp32 row is streamed once for all
-// M rows of bf16 activations.
-constexpr int ROUTER_THREADS = 256;
-constexpr int ROUTER_K = ROUTER_THREADS * 4;
-
-__global__ void __launch_bounds__(ROUTER_THREADS)
-router_logits_kernel(const __nv_bfloat16* __restrict__ x, const float* __restrict__ w, float* __restrict__ out, int M, int N, int K) {
-    __shared__ float red[ROUTER_THREADS / 32][MAX_M];
-    const float* wr = w + (size_t)blockIdx.x * K;
-    float acc[MAX_M];
-#pragma unroll
-    for (int m = 0; m < MAX_M; ++m) acc[m] = 0.f;
-#pragma unroll 4
-    for (int k = threadIdx.x * 4; k < K; k += ROUTER_K) {
-        const float4 v = *reinterpret_cast<const float4*>(wr + k);
-#pragma unroll
-        for (int m = 0; m < MAX_M; ++m) {
-            if (m >= M) break;
-            const __nv_bfloat162* xp = reinterpret_cast<const __nv_bfloat162*>(x + (size_t)m * K + k);
-            const float2 a = __bfloat1622float2(xp[0]), b = __bfloat1622float2(xp[1]);
-            acc[m] += a.x * v.x + a.y * v.y + b.x * v.z + b.y * v.w;
-        }
-    }
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-#pragma unroll
-    for (int m = 0; m < MAX_M; ++m) {
-        float s = acc[m];
-        for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
-        if (lane == 0) red[warp][m] = s;
-    }
-    __syncthreads();
-    if (threadIdx.x < M) {
-        float s = 0.f;
-#pragma unroll
-        for (int i = 0; i < ROUTER_THREADS / 32; ++i) s += red[i][threadIdx.x];
-        out[(size_t)threadIdx.x * N + blockIdx.x] = s;
-    }
+__global__ void l2_prefetch_kernel(const char* __restrict__ p, size_t bytes) {
+    for (size_t off = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 128; off < bytes; off += (size_t)gridDim.x * blockDim.x * 128)
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(p + off));
 }
 
 }  // namespace
 
-bool router_logits_supported(int64_t M, int64_t K) { return M >= 1 && M <= MAX_M && K % ROUTER_K == 0; }
-
-torch::Tensor router_logits(torch::Tensor x, torch::Tensor w) {
-    TORCH_CHECK(x.is_contiguous() && w.is_contiguous() && x.scalar_type() == at::kBFloat16 && w.scalar_type() == at::kFloat);
-    const at::cuda::CUDAGuard guard(x.device());
-    const int M = (int)x.size(0), K = (int)x.size(1), N = (int)w.size(0);
-    auto out = torch::empty({M, N}, x.options().dtype(at::kFloat));
-    router_logits_kernel<<<N, ROUTER_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), w.data_ptr<float>(), out.data_ptr<float>(), M, N, K);
-    return out;
+void l2_prefetch(torch::Tensor w, int64_t blocks) {
+    l2_prefetch_kernel<<<(int)blocks, 256, 0, at::cuda::getCurrentCUDAStream()>>>((const char*)w.data_ptr(), w.nbytes());
 }
 
 bool bf16_skinny_supported(int64_t M, int64_t N, int64_t K) { return M >= 1 && M <= MAX_M && N >= 256 && K % K_PIECE == 0; }
@@ -135,8 +109,17 @@ torch::Tensor bf16_skinny(torch::Tensor x, torch::Tensor w) {
     const at::cuda::CUDAGuard guard(x.device());
     const int M = (int)x.size(0), K = (int)x.size(1), N = (int)w.size(0);
     auto out = torch::empty({M, N}, x.options());
-    bf16_skinny_kernel<<<(N + ROWS - 1) / ROWS, THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), reinterpret_cast<const __nv_bfloat16*>(w.data_ptr()),
-        reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), M, N, K, (int)x.stride(0));
+    cudaLaunchConfig_t config = {};
+    config.gridDim = (N + ROWS - 1) / ROWS;
+    config.blockDim = THREADS;
+    config.stream = at::cuda::getCurrentCUDAStream();
+    cudaLaunchAttribute attr;
+    attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr.val.programmaticStreamSerializationAllowed = 1;
+    config.attrs = &attr;      // start streaming weights while the previous kernel finishes
+    config.numAttrs = 1;
+    C10_CUDA_CHECK(cudaLaunchKernelEx(&config, bf16_skinny_kernel, reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+                                      reinterpret_cast<const __nv_bfloat16*>(w.data_ptr()),
+                                      reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), M, N, K, (int)x.stride(0)));
     return out;
 }

@@ -262,11 +262,3 @@ def test_bf16_skinny_matches_cublas(M, N, K):
     w = torch.randn(N, K, dtype=torch.bfloat16, device="cuda") * 0.05
     got = cuda_ops.bf16_linear(x, w)
     torch.testing.assert_close(got.float(), F.linear(x.float(), w.float()), atol=0.08, rtol=0.02)
-
-
-@pytest.mark.parametrize("rows", [1, 6, 8])
-def test_router_logits_matches_fp32_linear(rows):
-    torch.manual_seed(0)
-    x = torch.randn(rows, 1024, device="cuda", dtype=torch.bfloat16)
-    w = torch.randn(288, 1024, device="cuda")
-    torch.testing.assert_close(cuda_ops.router_logits(x, w), F.linear(x.float(), w), rtol=1e-4, atol=1e-3)

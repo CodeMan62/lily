@@ -32,12 +32,21 @@ constexpr int ROWS_PER_WARP = 8;
 constexpr int ROWS_PER_BLOCK = WARPS_PER_BLOCK * ROWS_PER_WARP;  // 64 weight rows (output features)
 constexpr int SUPER_K = 128;
 constexpr int MAX_M = 16;
+constexpr int PREFETCH = 2;     // K steps in flight per lane: a step alone is one memory latency
+constexpr int MIN_BLOCKS = 4;   // caps registers at 64: at 2 blocks per SM, 24+ active experts need a second wave
 
 __device__ __forceinline__ void mma_16816_bf16(float c[4], const uint32_t a[4], const uint32_t b[2]) {
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+__device__ __forceinline__ uint4 load_stream(const void* p) {     // weights: read once, skip L1
+    uint4 v;
+    asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
+    return v;
 }
 
 __device__ __forceinline__ float e4m3_to_float(uint32_t b) {
@@ -72,7 +81,7 @@ __device__ __forceinline__ uint32_t load_x_pair(const __nv_bfloat16* __restrict_
     return 0u;
 }
 
-__global__ void __launch_bounds__(THREADS)
+__global__ void __launch_bounds__(THREADS, MIN_BLOCKS)
 nvfp4_moe_gemm_kernel(const __nv_bfloat16* __restrict__ x,    // [T, K]
                       const uint8_t* __restrict__ w,           // [E, N, K/2]
                       const uint8_t* __restrict__ scale,       // [E, N, K/16]
@@ -86,8 +95,6 @@ nvfp4_moe_gemm_kernel(const __nv_bfloat16* __restrict__ x,    // [T, K]
     const int e_slot = blockIdx.y;
     const int e = active_experts[e_slot];
     if (e < 0) return;
-    const int r0 = offsets[e], r1 = offsets[e + 1];
-    if (r0 == r1) return;
 
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int g = lane >> 2, t = lane & 3;
@@ -97,25 +104,44 @@ nvfp4_moe_gemm_kernel(const __nv_bfloat16* __restrict__ x,    // [T, K]
 
     const uint8_t* __restrict__ wrow = w + ((size_t)e * N + n_row) * (K / 2);
     const uint8_t* __restrict__ srow = scale + ((size_t)e * N + n_row) * (K / 16);
+    uint4 ring[PREFETCH];
+    uint32_t ring_s[PREFETCH];
+    auto fill = [&] {
+#pragma unroll
+        for (int d = 0; d < PREFETCH; ++d) {
+            const int k = min(d * SUPER_K, K - SUPER_K);
+            ring[d] = load_stream(wrow + (k + 32 * t) / 2);
+            ring_s[d] = *reinterpret_cast<const uint16_t*>(srow + (k + 32 * t) / 16);
+        }
+    };
+    fill();                     // before the routing reads below, so those latencies overlap
+    const int r0 = offsets[e], r1 = offsets[e + 1];
+    if (r0 == r1) return;
     const int n0 = n_base + 2 * t, n1 = n0 + 1;
     const float inv0 = n0 < N ? 1.f / gscale[(size_t)e * gs_rows + (gs_rows == 1 ? 0 : n0)] : 0.f;
     const float inv1 = n1 < N ? 1.f / gscale[(size_t)e * gs_rows + (gs_rows == 1 ? 0 : n1)] : 0.f;
 
     // 16 rows of this expert at a time
     for (int rbase = r0; rbase < r1; rbase += MAX_M) {
+        if (rbase != r0) fill();
         const int ra = rbase + g, rb = rbase + g + 8;                 // the two pair rows this lane feeds
         const int tok_a = ra < r1 ? tokens[ra] : 0;
         const int tok_b = rb < r1 ? tokens[rb] : 0;
         const int va = ra < r1, vb = rb < r1;
         float acc[4] = {0.f, 0.f, 0.f, 0.f};
 
-        uint4 packed = *reinterpret_cast<const uint4*>(wrow + (32 * t) / 2);
-        uint32_t s2 = *reinterpret_cast<const uint16_t*>(srow + (32 * t) / 16);
-        for (int ks = 0; ks < K; ks += SUPER_K) {
-            // the next K step's weights stay in flight during this step's maths
-            const int kn = ks + SUPER_K < K ? ks + SUPER_K : ks;
-            const uint4 packed_next = *reinterpret_cast<const uint4*>(wrow + (kn + 32 * t) / 2);
-            const uint32_t s2_next = *reinterpret_cast<const uint16_t*>(srow + (kn + 32 * t) / 16);
+        for (int k0 = 0; k0 < K; k0 += PREFETCH * SUPER_K) {
+#pragma unroll
+          for (int d = 0; d < PREFETCH; ++d) {
+            const int ks = k0 + d * SUPER_K;
+            if (ks >= K) break;
+            const uint4 packed = ring[d];
+            const uint32_t s2 = ring_s[d];
+            const int kn = ks + PREFETCH * SUPER_K;
+            if (kn < K) {
+                ring[d] = load_stream(wrow + (kn + 32 * t) / 2);
+                ring_s[d] = *reinterpret_cast<const uint16_t*>(srow + (kn + 32 * t) / 16);
+            }
             const uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
             const __nv_bfloat162 sc[2] = {__float2bfloat162_rn(e4m3_to_float(s2 & 0xFFu)),
                                           __float2bfloat162_rn(e4m3_to_float((s2 >> 8) & 0xFFu))};
@@ -134,8 +160,7 @@ nvfp4_moe_gemm_kernel(const __nv_bfloat16* __restrict__ x,    // [T, K]
                 const uint32_t afrag[4] = {xa.x, xb.x, xa.y, xb.y};
                 mma_16816_bf16(acc, afrag, bfrag);
             }
-            packed = packed_next;
-            s2 = s2_next;
+          }
         }
         // C fragment -> pair rows ra (acc[0], acc[1]) and rb (acc[2], acc[3]) at columns n0, n1
         if (va) {

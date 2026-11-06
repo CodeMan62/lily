@@ -163,6 +163,11 @@ def kda_fused_replay(table, proj_stride: int, beta_stride: int, fgate_stride: in
 
 # ---- bf16 linears of decode and verify batches ---------------------------------------------
 
+def l2_prefetch(w: torch.Tensor) -> None:
+    """Pull `w` into L2; a few blocks are enough and more would slow what runs beside them."""
+    _module().l2_prefetch(w, 32)
+
+
 def bf16_linear(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     """x @ w^T: the weight-streaming kernel for small batches, cuBLAS otherwise."""
     mod = _module()
@@ -172,14 +177,6 @@ def bf16_linear(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
             and w.is_contiguous() and mod.bf16_skinny_supported(rows, w.shape[0], x.shape[-1])):
         return mod.bf16_skinny(x if strided else x.view(rows, -1), w).view(*x.shape[:-1], w.shape[0])
     return torch.nn.functional.linear(x, w)
-
-
-def router_logits(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-    """fp32 x @ w^T for a bf16 `x` [T, K] and fp32 router `w`."""
-    mod = _module()
-    if mod is not None and x.is_cuda and x.dtype == torch.bfloat16 and x.is_contiguous() and mod.router_logits_supported(x.shape[0], x.shape[1]):
-        return mod.router_logits(x, w)
-    return torch.nn.functional.linear(x.float(), w)
 
 
 # ---- MoE experts ------------------------------------------------------------------------

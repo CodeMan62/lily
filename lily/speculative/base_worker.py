@@ -18,8 +18,6 @@ Drafting strategies: `mtp_worker.MTPSpecWorker` (the checkpoint's MTP head, chai
 from __future__ import annotations
 
 import logging
-import os
-import time
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
@@ -116,38 +114,6 @@ def rejection_sample(target: torch.Tensor, draft: torch.Tensor, draft_tokens: to
     return first_reject, corr
 
 
-class _StageTimer:
-    """`LILY_SPEC_TIMING=1`: mean wall time of each stage of a round (synchronizes between stages)."""
-
-    enabled = bool(os.environ.get("LILY_SPEC_TIMING"))
-
-    def __init__(self):
-        self.total: dict = {}
-        self.rounds = 0
-        self.t = 0.0
-
-    def start(self) -> None:
-        if self.enabled:
-            torch.cuda.synchronize()
-            now = time.perf_counter()
-            if self.t:      # between rounds: the scheduler
-                self.total["outside"] = self.total.get("outside", 0.0) + now - self.t
-            self.t = now
-
-    def mark(self, stage: str) -> None:
-        if self.enabled:
-            torch.cuda.synchronize()
-            now = time.perf_counter()
-            self.total[stage] = self.total.get(stage, 0.0) + now - self.t
-            self.t = now
-
-    def end_round(self) -> None:
-        if self.enabled:
-            self.rounds += 1
-            if self.rounds % 200 == 0:
-                logger.info("spec round ms: %s", {k: round(v / self.rounds * 1e3, 2) for k, v in self.total.items()})
-
-
 class SpecWorkerBase:
     """Verify / accept / rollback shared by every drafting strategy."""
 
@@ -174,7 +140,6 @@ class SpecWorkerBase:
         self.accepted_drafts_total = 0
         self.request_rounds = 0
         self.rounds = 0
-        self.timer = _StageTimer()
         self.verified_in_graph = False
 
     def _init_verify_graphs(self, server_args) -> None:
@@ -276,14 +241,11 @@ class SpecWorkerBase:
         sampling = not all(p.greedy for p in params)
 
         # ---- 1. draft ----
-        self.timer.start()
         if k > 0:
             dtoks, dprobs = self.draft(reqs, k, m, slots, req_idx, sampling)
         else:
             dtoks = torch.zeros(B, 0, dtype=torch.int64, device=dev)
             dprobs = None
-
-        self.timer.mark("draft")
 
         # ---- 2. verify: target extend over [x_{m+1}, d_1..d_k] ----
         tail = int_tensor([r.output_ids[-1] for r in reqs], dev)
@@ -308,7 +270,6 @@ class SpecWorkerBase:
                 [layer.replay_table_row(stash[layer.linear_layer_idx], self.pool) for layer in self.gdn_layers],
                 dtype=torch.int64).to(dev, non_blocking=True)) if hybrid else None
 
-        self.timer.mark("verify")
 
         # ---- 3. accept ----
         sampler_output = None
@@ -356,7 +317,6 @@ class SpecWorkerBase:
 
         if pipelined:
             self.note_prefetch([mi + j + 1 for mi, j in zip(m, num_acc_cpu)])
-        self.timer.mark("accept")
 
         # ---- 4. GDN rollback: replay accepted prefixes from the snapshots (one launch) ----
         if hybrid and not pipelined and any(j < k for j in num_acc_cpu):
@@ -365,12 +325,9 @@ class SpecWorkerBase:
             lens = int_tensor([j + 1 for j in num_acc_cpu], dev, torch.int32)
             self.gdn_layers[0].replay(table, stash[0], starts, lens, req_idx.contiguous(), self.pool)
 
-        self.timer.mark("rollback")
 
         # ---- 5. drafter state from the accepted rows ----
         self.after_accept(reqs, accepted, num_acc_cpu, hidden, aux, slots, m, k, sampling)
-        self.timer.mark("after_accept")
-        self.timer.end_round()
 
         self.rounds += 1
         self.request_rounds += B

@@ -1,11 +1,7 @@
 """Scheduler"""
 from __future__ import annotations
 
-import cProfile
-import io
 import logging
-import os
-import pstats
 import queue
 import threading
 import time
@@ -765,22 +761,10 @@ def run_scheduler_process(
     scheduler = Scheduler(model_config, server_args, tp_rank=tp_rank)
     prev = None
     logger.info("scheduler ready (tp rank %d/%d)", tp_rank, server_args.tp_size)
-    prof_every = int(os.environ.get("LILY_SCHED_PROFILE", "0")) if tp_rank == 0 else 0   # cProfile of the loop
-    prof, loops = (cProfile.Profile(), 0) if prof_every else (None, 0)
     step_count = 0
 
     try:
         while stop_event is None or not stop_event.is_set():
-            if prof is not None and scheduler.running_batch is not None:
-                loops += 1
-                if loops == 300:
-                    prof.enable()
-                elif loops == 300 + prof_every:
-                    prof.disable()
-                    buf = io.StringIO()
-                    pstats.Stats(prof, stream=buf).sort_stats("tottime").print_stats(28)
-                    logger.info("scheduler loop profile, %d iterations:\n%s", prof_every, buf.getvalue())
-                    prof = None
             # The lockstep broadcast below is a gloo round trip: while decoding, take new messages
             # every few iterations only. `running_batch` and the counter agree on every rank.
             step_count += 1
