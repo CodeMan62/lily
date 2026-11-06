@@ -23,7 +23,7 @@ from torch import nn
 
 from lily.distributed import get_tp_info, tensor_model_parallel_all_reduce
 from lily.layers.quantization import cuda_ops
-from lily.utils import run_beside
+from lily.utils import run_beside, start_beside
 from lily.layers.quantization.base import NVFP4_GROUP_SIZE, nvfp4_dequantize
 
 
@@ -139,6 +139,7 @@ class NVFP4MoE(nn.Module):
         self.experts = NVFP4Experts(num_experts, hidden_size, self.intermediate_size)
         self.shared_experts = shared_expert
         self._arange: dict = {}
+        self.next_weights: Optional[torch.Tensor] = None
 
     def _rows(self, n: int, device) -> torch.Tensor:
         """arange(n), kept so a CUDA graph reads one stable tensor."""
@@ -165,6 +166,8 @@ class NVFP4MoE(nn.Module):
 
         # the shared expert hides routing, whose kernels leave most of the GPU idle
         shared, (down, inv, weights) = run_beside(lambda: self.shared_experts(x) if self.shared_experts is not None else None, routed)
+        if self.next_weights is not None:       # read next, while the all-reduce leaves memory idle
+            start_beside(lambda: cuda_ops.l2_prefetch(self.next_weights))
         return tensor_model_parallel_all_reduce(cuda_ops.moe_combine(down, inv, weights, shared))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

@@ -92,3 +92,12 @@ def run_beside(side_fn, main_fn):
     b = main_fn()
     main.wait_stream(side)
     return a, b
+
+
+def start_beside(fn) -> None:
+    """Queue `fn` on the side stream of a CUDA graph being captured; the next `run_beside` joins it."""
+    if torch.cuda.is_current_stream_capturing():
+        side = _side_stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            fn()

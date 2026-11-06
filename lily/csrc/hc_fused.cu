@@ -88,6 +88,7 @@ hc_collapse_kernel(const __nv_bfloat16* __restrict__ streams, const float* __res
                    __nv_bfloat16* __restrict__ normed, int H, int iters, float hc_eps, float rms_eps, float norm_eps) {
     __shared__ float pre[N];
     __shared__ float red[THREADS / 32];
+    asm volatile("griddepcontrol.launch_dependents;");  // the next GEMM may start streaming its weights
     const int t = blockIdx.x;
     if (threadIdx.x < 32) {
         const int lane = threadIdx.x;

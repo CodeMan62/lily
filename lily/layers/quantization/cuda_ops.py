@@ -163,6 +163,11 @@ def kda_fused_replay(table, proj_stride: int, beta_stride: int, fgate_stride: in
 
 # ---- bf16 linears of decode and verify batches ---------------------------------------------
 
+def l2_prefetch(w: torch.Tensor) -> None:
+    """Pull `w` into L2; a few blocks are enough and more would slow what runs beside them."""
+    _module().l2_prefetch(w, 32)
+
+
 def bf16_linear(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     """x @ w^T: the weight-streaming kernel for small batches, cuBLAS otherwise."""
     mod = _module()

@@ -41,6 +41,9 @@ from lily.models.registry import ModelRegistry
 # mHC hyper-connections
 # ---------------------------------------------------------------------------------------------
 
+PREFETCH_BYTES = 32 << 20      # of the next layer's first GEMM, well within L2
+
+
 class HyperConnection(nn.Module):
     """Manifold-constrained hyper-connections (mirrors Glm5NextTextHyperConnection).
 
@@ -857,4 +860,9 @@ class Glm5FlashForCausalLM(LlamaForCausalLMBase):
         for module in self.modules():
             if isinstance(module, KimiDeltaAttention):
                 module.merge_small_projections()
+        for layer, following in zip(self.model.layers, self.model.layers[1:]):
+            if isinstance(layer.mlp, NVFP4MoE) and isinstance(following.mlp, NVFP4MoE):
+                attn = following.self_attn
+                first = attn.qkv_proj if following.is_linear else attn.q_a_proj
+                layer.mlp.next_weights = first.weight.data.view(-1)[:PREFETCH_BYTES // 2]
         return loaded, unexpected
