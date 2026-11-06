@@ -1,4 +1,5 @@
 # lily
+<img width="400" height="250" alt="image" src="https://github.com/user-attachments/assets/af6d2aae-7077-4d8c-bc79-f0c757a9a88c" />
 
 lily is an LLM inference engine. It has an OpenAI-compatible HTTP server, a
 batched scheduler, CUDA graphs, tensor and expert parallelism, NVFP4 weights, and speculative
