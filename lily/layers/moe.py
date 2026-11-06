@@ -116,45 +116,59 @@ def sort_by_expert(expert_ids: torch.Tensor, num_experts: int):
 
 
 class NVFP4MoE(nn.Module):
-    """Under tensor parallelism the experts are split across ranks (expert parallelism): rank r
-    owns experts [r * E/tp, (r+1) * E/tp), the router is replicated, each rank computes its
-    experts' share of every token and one all-reduce sums the ranks (the shared expert, itself
-    row-parallel, is folded into the same all-reduce: build it with `reduce_results=False`)."""
+    """Under tensor parallelism every rank holds a 1/tp slice of every expert's intermediate dim
+    (gate/up rows, down columns) and one all-reduce sums the ranks. Expert parallelism would read
+    less per rank on average, but a decode token's few experts land unevenly and every rank then
+    waits for the busiest one; with slices all ranks read the same bytes. The router is replicated
+    and the shared expert, itself row-parallel, is folded into the same all-reduce (build it with
+    `reduce_results=False`)."""
+
+    SMALL_BATCH = 64     # tokens the fused routing path takes; the route kernel is one block
 
     def __init__(self, hidden_size: int, intermediate_size: int, num_experts: int, top_k: int,
                  routed_scaling_factor: float, norm_topk_prob: bool, swiglu_limit: Optional[float],
-                 shared_expert: Optional[nn.Module], max_active_experts: Optional[int] = None):
+                 shared_expert: Optional[nn.Module]):
         super().__init__()
-        tp_size, tp_rank = get_tp_info()
-        assert num_experts % tp_size == 0, (num_experts, tp_size)
-        self.hidden_size, self.intermediate_size = hidden_size, intermediate_size
+        tp_size, _ = get_tp_info()
+        assert intermediate_size % tp_size == 0, (intermediate_size, tp_size)
+        self.hidden_size, self.intermediate_size = hidden_size, intermediate_size // tp_size
         self.num_experts, self.top_k = num_experts, top_k
-        self.local_experts = num_experts // tp_size
-        self.expert_offset = tp_rank * self.local_experts
         self.swiglu_limit = swiglu_limit
         self.gate = TopkRouter(hidden_size, num_experts, top_k, routed_scaling_factor, norm_topk_prob)
-        self.experts = NVFP4Experts(self.local_experts, hidden_size, intermediate_size)
+        self.experts = NVFP4Experts(num_experts, hidden_size, self.intermediate_size)
         self.shared_experts = shared_expert
-        # the grouped kernel's grid is sized for this many active experts per call
-        self.max_active_experts = min(max_active_experts or self.local_experts, self.local_experts)
+        self._arange: dict = {}
 
-    @property
-    def expert_parallel(self) -> bool:
-        return self.local_experts != self.num_experts
+    def _rows(self, n: int, device) -> torch.Tensor:
+        """arange(n), kept so a CUDA graph reads one stable tensor."""
+        rows = self._arange.get(n)
+        if rows is None:
+            rows = self._arange[n] = torch.arange(n, dtype=torch.int32, device=device)
+        return rows
+
+    def _forward_small_batch(self, x: torch.Tensor) -> torch.Tensor:
+        """Decode and verify batches: same maths as `forward` through the fused routing kernels."""
+        g, ex = self.gate, self.experts
+        logits = cuda_ops.router_logits(x, g.weight)
+        weights, active, offsets, tokens, inv = cuda_ops.moe_route(
+            logits, g.e_score_correction_bias, self.top_k, g.routed_scaling_factor, g.norm_topk_prob, 0, self.num_experts)
+        R = x.shape[0] * self.top_k
+        active = active[:R]                 # at most one expert per row: the GEMM's grid needs no more
+        gate_up = cuda_ops.nvfp4_moe_gemm(x, ex.gate_up_packed, ex.gate_up_scale.view(torch.uint8), ex.gate_up_gscale,
+                                          active, offsets, tokens, R)
+        act = cuda_ops.moe_swiglu(gate_up, self.swiglu_limit)
+        down = cuda_ops.nvfp4_moe_gemm(act, ex.down_packed, ex.down_scale.view(torch.uint8), ex.down_gscale,
+                                       active, offsets, self._rows(R, x.device), R)
+        shared = self.shared_experts(x) if self.shared_experts is not None else None
+        return tensor_model_parallel_all_reduce(cuda_ops.moe_combine(down, inv, weights, shared))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         T = x.shape[0]
-        weights, ids = self.gate(x)                                     # [T, k] global expert ids
-        E = self.local_experts
-        ids = ids - self.expert_offset
-        if self.expert_parallel:
-            # other ranks' experts go to a dummy bucket E that no kernel launch touches
-            ids = ids.masked_fill((ids < 0) | (ids >= E), E)
-        active, offsets, tokens, order = sort_by_expert(ids, E + 1 if self.expert_parallel else E)
-        active = active[: self.max_active_experts]
-        if self.expert_parallel:
-            active = active.masked_fill(active >= E, -1)
-            offsets = offsets[: E + 1]        # the kernel wants [E+1]; offsets[E] is where the dummy rows start
+        if x.is_cuda and cuda_ops.nvfp4_moe_supported(x.shape[1]) and T <= self.SMALL_BATCH \
+                and cuda_ops.moe_route_supported(T, self.top_k, self.num_experts):
+            return self._forward_small_batch(x)
+        weights, ids = self.gate(x)                                     # [T, k]
+        active, offsets, tokens, order = sort_by_expert(ids, self.num_experts)
         R = T * self.top_k
         ex = self.experts
         if cuda_ops.available() and cuda_ops.nvfp4_moe_supported(x.shape[1]):
@@ -162,15 +176,10 @@ class NVFP4MoE(nn.Module):
                                               active, offsets, tokens, R)                     # [R, 2I]
             act = clamped_swiglu(gate_up[:, :self.intermediate_size], gate_up[:, self.intermediate_size:], self.swiglu_limit)
             # the down projection's "tokens" are the sorted rows themselves
-            rows = torch.arange(R, dtype=torch.int32, device=x.device)
             down = cuda_ops.nvfp4_moe_gemm(act.contiguous(), ex.down_packed, ex.down_scale.view(torch.uint8), ex.down_gscale,
-                                           active, offsets, rows, R)                           # [R, H]
+                                           active, offsets, self._rows(R, x.device), R)         # [R, H]
         else:
             down = self._eager(x, ids, order)
-        if self.expert_parallel:
-            # rows of the dummy bucket were never written: they sort last, after offsets[E]
-            local = torch.arange(R, device=x.device).unsqueeze(1) < offsets[E]   # dummy rows sort last
-            down = torch.where(local, down, torch.zeros((), dtype=down.dtype, device=x.device))
         # back to token order: sorted row r is (token, slot) = divmod(order[r], k). A gather and a
         # fixed-order sum over the k slots (not index_add_'s atomics) keeps the result deterministic.
         inv = torch.empty_like(order)
@@ -182,14 +191,12 @@ class NVFP4MoE(nn.Module):
         return tensor_model_parallel_all_reduce(out)
 
     def _eager(self, x, ids, order):
-        """Dequantized per-expert path (tests, CPU, odd shapes). `ids` are local expert ids."""
+        """Dequantized per-expert path (tests, CPU, odd shapes)."""
         T, k = ids.shape
         flat = ids.reshape(-1)[order]
         tok = order // k
         down = torch.zeros(T * k, self.hidden_size, dtype=x.dtype, device=x.device)
         for e in flat.unique().tolist():
-            if e >= self.local_experts:
-                continue
             rows = (flat == e).nonzero(as_tuple=True)[0]
             gu, dn = self.experts.dequantize(e)
             h = F.linear(x[tok[rows]], gu)

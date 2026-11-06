@@ -109,10 +109,14 @@ nvfp4_moe_gemm_kernel(const __nv_bfloat16* __restrict__ x,    // [T, K]
         const int va = ra < r1, vb = rb < r1;
         float acc[4] = {0.f, 0.f, 0.f, 0.f};
 
+        uint4 packed = *reinterpret_cast<const uint4*>(wrow + (32 * t) / 2);
+        uint32_t s2 = *reinterpret_cast<const uint16_t*>(srow + (32 * t) / 16);
         for (int ks = 0; ks < K; ks += SUPER_K) {
-            const uint4 packed = *reinterpret_cast<const uint4*>(wrow + (ks + 32 * t) / 2);
+            // the next K step's weights stay in flight during this step's maths
+            const int kn = ks + SUPER_K < K ? ks + SUPER_K : ks;
+            const uint4 packed_next = *reinterpret_cast<const uint4*>(wrow + (kn + 32 * t) / 2);
+            const uint32_t s2_next = *reinterpret_cast<const uint16_t*>(srow + (kn + 32 * t) / 16);
             const uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
-            const uint32_t s2 = *reinterpret_cast<const uint16_t*>(srow + (ks + 32 * t) / 16);
             const __nv_bfloat162 sc[2] = {__float2bfloat162_rn(e4m3_to_float(s2 & 0xFFu)),
                                           __float2bfloat162_rn(e4m3_to_float((s2 >> 8) & 0xFFu))};
 #pragma unroll
@@ -130,6 +134,8 @@ nvfp4_moe_gemm_kernel(const __nv_bfloat16* __restrict__ x,    // [T, K]
                 const uint32_t afrag[4] = {xa.x, xb.x, xa.y, xb.y};
                 mma_16816_bf16(acc, afrag, bfrag);
             }
+            packed = packed_next;
+            s2 = s2_next;
         }
         // C fragment -> pair rows ra (acc[0], acc[1]) and rb (acc[2], acc[3]) at columns n0, n1
         if (va) {

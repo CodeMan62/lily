@@ -98,6 +98,7 @@ class DetokenizerFrontend:
             info: Dict[str, Any] = {
                 "prompt_tokens": msg.prompt_tokens[i],
                 "completion_tokens": msg.completion_tokens[i],
+                "output_ids": msg.output_ids[i],      # this chunk's new tokens
             }
             if msg.logprobs is not None and msg.logprobs[i] is not None:
                 info["output_token_logprobs"] = msg.logprobs[i]

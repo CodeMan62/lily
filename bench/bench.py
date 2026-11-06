@@ -72,6 +72,20 @@ def _random_ids(n: int, vocab: int, seed: int) -> List[int]:
     return [rng.randint(lo, hi) for _ in range(n)]
 
 
+# Natural prompts for speculative decoding: on random token ids the drafter has nothing to predict,
+# so its acceptance (and the tok/s it buys) says nothing about real traffic.
+REAL_PROMPTS = [
+    "Write a Python class implementing an LRU cache with O(1) get and put, then explain how it works.",
+    "Explain step by step how TCP congestion control works, covering slow start and fast recovery.",
+    "Solve this and show your work: a train leaves at 3pm at 60 km/h, a second leaves at 4pm at 90 km/h on the same track. When does it catch up?",
+    "Write a short story about a lighthouse keeper who discovers a message in a bottle.",
+    "Compare PostgreSQL and MongoDB for an e-commerce backend. Give concrete trade-offs.",
+    "Write a C function that reverses a singly linked list, with comments, and a small test in main.",
+    "Summarize the causes of the French Revolution in a few paragraphs.",
+    "Explain what gradient descent is to a high school student, then give the update rule and a tiny numpy example.",
+]
+
+
 # ---------------------------------------------------------------------------
 # phase 1: engine
 # ---------------------------------------------------------------------------

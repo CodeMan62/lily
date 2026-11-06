@@ -67,6 +67,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
         layer.register_parameter("weight", weight)
 
     def apply(self, layer, x, bias=None):
+        if bias is None:
+            return cuda_ops.bf16_linear(x, layer.weight)
         return F.linear(x, layer.weight, bias)
 
 

@@ -24,6 +24,7 @@ import torch
 from lily.layers.logits_processor import LogitsProcessorOutput
 from lily.model_executor.cuda_graph_runner import capture_buckets, seq_len_fill, warmup_and_capture
 from lily.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from lily.utils import int_tensor
 
 logger = logging.getLogger(__name__)
 
@@ -49,8 +50,9 @@ class _VerifyBuffers:
 class VerifyGraphRunner:
     """Graphs of the target's verify extend, one per batch-size bucket."""
 
-    def __init__(self, model_runner, k: int, num_gdn_layers: int, aux_layers=None):
+    def __init__(self, model_runner, k: int, num_gdn_layers: int, aux_layers=None, hook=None):
         self.runner = model_runner
+        self.hook = hook
         self.aux_layers = list(aux_layers) if aux_layers else None
         self.device = model_runner.device
         self.k = k
@@ -116,7 +118,10 @@ class VerifyGraphRunner:
         def run():
             if runner.attn_backend is not None:
                 runner.attn_backend.init_forward_metadata(fb)
-            return runner.model(fb.input_ids, fb.positions, fb)
+            out = runner.model(fb.input_ids, fb.positions, fb)
+            if self.hook is not None:
+                self.hook(out, fb)
+            return out
 
         graph, out = warmup_and_capture(run)
         self.graphs[bs], self.buffers[bs], self.batches[bs], self.outputs[bs] = graph, buf, fb, out
@@ -139,7 +144,7 @@ class VerifyGraphRunner:
         buf, n = self.buffers[bucket], self.n
         T = bs * n
         dev = self.device
-        prefix = torch.tensor(prefix_lens, dtype=torch.int64, device=dev)
+        prefix = int_tensor(prefix_lens, dev)
         buf.input_ids[:T].copy_(input_ids)
         buf.out_cache_loc[:T].copy_(out_cache_loc)
         buf.req_pool_indices[:bs].copy_(req_pool_indices)
@@ -168,6 +173,61 @@ class VerifyGraphRunner:
             self.replay_tables[bucket] = table
         return table
 
+
+
+class DFlashDraftGraphRunner:
+    """Graphs of one greedy DFlash drafter pass, per (batch-size bucket, context-length bucket).
+    Context rows past a request's length are masked, so a bucket above the need changes nothing."""
+
+    def __init__(self, worker, model_runner):
+        self.worker = worker
+        self.device = model_runner.device
+        args = model_runner.server_args
+        max_bs = args.cuda_graph_max_bs or min(model_runner.max_running_requests, 16)
+        self.capture_bs = capture_buckets(max(1, int(max_bs)), args.cuda_graph_bs)
+        top = min(worker.window, model_runner.req_to_token_pool.max_context_len)
+        self.lengths = sorted({min(n, top) for n in (256, 512, 1024, 2048, top)})
+        self.graphs: Dict[tuple, torch.cuda.CUDAGraph] = {}
+        self.outputs: Dict[tuple, torch.Tensor] = {}
+        self.buffers: Dict[int, tuple] = {}
+        for bs in self.capture_bs:
+            self.buffers[bs] = (torch.zeros(bs, dtype=torch.int64, device=self.device),      # anchor
+                                torch.ones(bs, dtype=torch.int64, device=self.device),       # m
+                                torch.zeros(bs, dtype=torch.int64, device=self.device))      # request rows
+            for L in self.lengths:
+                self._capture(bs, L)
+        logger.info("captured DFlash draft graphs for batch sizes %s, context %s", self.capture_bs, self.lengths)
+
+    @torch.inference_mode()
+    def _capture(self, bs: int, L: int) -> None:
+        anchor, m, req = self.buffers[bs]
+        w = self.worker
+
+        def run():
+            hidden, logits = w.draft_pass(anchor, m, req, L, w.k)
+            return w.drafter.candidate_selector.select(hidden, logits, anchor, [0.0] * bs, [None] * bs)[0]
+
+        self.graphs[bs, L], self.outputs[bs, L] = warmup_and_capture(run)
+
+    @torch.inference_mode()
+    def replay(self, anchor: torch.Tensor, m: torch.Tensor, req_idx: torch.Tensor, L: int) -> torch.Tensor:
+        """-> draft tokens int64 [B, k]; a view of the graph's output, consumed by the verify step."""
+        B = anchor.shape[0]
+        bs = next(b for b in self.capture_bs if b >= B)
+        length = next((n for n in self.lengths if n >= L), self.lengths[-1])
+        buf_anchor, buf_m, buf_req = self.buffers[bs]
+        buf_anchor[:B].copy_(anchor)
+        buf_m[:B].copy_(m)
+        buf_req[:B].copy_(req_idx)
+        if bs > B:
+            buf_anchor[B:].zero_()
+            buf_m[B:].fill_(1)
+            buf_req[B:].zero_()
+        self.graphs[bs, length].replay()
+        return self.outputs[bs, length][:B]
+
+    def can_run(self, bs: int) -> bool:
+        return bs <= self.capture_bs[-1]
 
 
 @dataclass

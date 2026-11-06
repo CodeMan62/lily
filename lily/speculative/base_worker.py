@@ -18,13 +18,17 @@ Drafting strategies: `mtp_worker.MTPSpecWorker` (the checkpoint's MTP head, chai
 from __future__ import annotations
 
 import logging
+import os
+import time
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
 import torch
 
+from lily.distributed import tensor_model_parallel_broadcast
 from lily.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from lily.sampling.sampling_params import SamplingParams
+from lily.utils import int_tensor
 
 logger = logging.getLogger(__name__)
 
@@ -112,11 +116,45 @@ def rejection_sample(target: torch.Tensor, draft: torch.Tensor, draft_tokens: to
     return first_reject, corr
 
 
+class _StageTimer:
+    """`LILY_SPEC_TIMING=1`: mean wall time of each stage of a round (synchronizes between stages)."""
+
+    enabled = bool(os.environ.get("LILY_SPEC_TIMING"))
+
+    def __init__(self):
+        self.total: dict = {}
+        self.rounds = 0
+        self.t = 0.0
+
+    def start(self) -> None:
+        if self.enabled:
+            torch.cuda.synchronize()
+            now = time.perf_counter()
+            if self.t:      # between rounds: the scheduler
+                self.total["outside"] = self.total.get("outside", 0.0) + now - self.t
+            self.t = now
+
+    def mark(self, stage: str) -> None:
+        if self.enabled:
+            torch.cuda.synchronize()
+            now = time.perf_counter()
+            self.total[stage] = self.total.get(stage, 0.0) + now - self.t
+            self.t = now
+
+    def end_round(self) -> None:
+        if self.enabled:
+            self.rounds += 1
+            if self.rounds % 200 == 0:
+                logger.info("spec round ms: %s", {k: round(v / self.rounds * 1e3, 2) for k, v in self.total.items()})
+
+
 class SpecWorkerBase:
     """Verify / accept / rollback shared by every drafting strategy."""
 
     #: target residual streams (layer ids) the drafter needs from every verify / prefill
     aux_layers: Optional[List[int]] = None
+    #: called inside the verify graph with (output, forward batch), for fixed-shape drafter updates
+    verify_hook = None
 
     def __init__(self, model_runner, server_args, k: int):
         self.runner = model_runner
@@ -136,6 +174,8 @@ class SpecWorkerBase:
         self.accepted_drafts_total = 0
         self.request_rounds = 0
         self.rounds = 0
+        self.timer = _StageTimer()
+        self.verified_in_graph = False
 
     def _init_verify_graphs(self, server_args) -> None:
         backend = self.runner.attn_backend
@@ -146,7 +186,7 @@ class SpecWorkerBase:
         from lily.speculative.graph_runner import VerifyGraphRunner
 
         try:
-            self.verify_graphs = VerifyGraphRunner(self.runner, self.k, len(self.gdn_layers), self.aux_layers)
+            self.verify_graphs = VerifyGraphRunner(self.runner, self.k, len(self.gdn_layers), self.aux_layers, self.verify_hook)
         except Exception as exc:  # pragma: no cover - fall back to eager rounds
             logger.warning("speculative verify graph capture failed; rounds run eagerly: %s", exc)
             self.verify_graphs = None
@@ -159,6 +199,18 @@ class SpecWorkerBase:
 
     def draft(self, reqs, k: int, m: List[int], slots: torch.Tensor, req_idx: torch.Tensor, sampling: bool):
         """-> (draft tokens int64 [B, k] on device, draft distributions [B, k, V] fp32)."""
+        raise NotImplementedError
+
+    def can_prefetch(self, batch_size: int) -> bool:
+        """Whether `prefetch_draft` can start the next round's draft for this batch."""
+        return False
+
+    def prefetch_draft(self, reqs, k: int, m: List[int], req_idx: torch.Tensor, anchor: torch.Tensor, num_acc: torch.Tensor) -> None:
+        """Start the next draft from device values, before the host knows the accepted counts."""
+        raise NotImplementedError
+
+    def note_prefetch(self, next_m: List[int]) -> None:
+        """The cached lengths the prefetched draft assumed, now known on the host."""
         raise NotImplementedError
 
     def after_accept(self, reqs, accepted, num_acc: List[int], hidden: torch.Tensor,
@@ -224,17 +276,21 @@ class SpecWorkerBase:
         sampling = not all(p.greedy for p in params)
 
         # ---- 1. draft ----
+        self.timer.start()
         if k > 0:
             dtoks, dprobs = self.draft(reqs, k, m, slots, req_idx, sampling)
         else:
             dtoks = torch.zeros(B, 0, dtype=torch.int64, device=dev)
             dprobs = None
 
+        self.timer.mark("draft")
+
         # ---- 2. verify: target extend over [x_{m+1}, d_1..d_k] ----
-        tail = torch.tensor([r.output_ids[-1] for r in reqs], dtype=torch.int64, device=dev)
+        tail = int_tensor([r.output_ids[-1] for r in reqs], dev)
         verify_ids = torch.cat([tail.unsqueeze(1), dtoks], dim=1).reshape(-1)
         hybrid = bool(self.gdn_layers) and k > 0
-        if self.verify_graphs is not None and self.verify_graphs.can_run(B, k, m):
+        self.verified_in_graph = self.verify_graphs is not None and self.verify_graphs.can_run(B, k, m)
+        if self.verified_in_graph:
             logits, hidden, aux, stash = self.verify_graphs.replay(verify_ids, req_idx, m, worker_batch.out_cache_loc)
             logits = logits.view(B, k + 1, -1)
             table_fn = (lambda: self.verify_graphs.replay_table(B, self.gdn_layers, self.pool)) if hybrid else None
@@ -252,6 +308,8 @@ class SpecWorkerBase:
                 [layer.replay_table_row(stash[layer.linear_layer_idx], self.pool) for layer in self.gdn_layers],
                 dtype=torch.int64).to(dev, non_blocking=True)) if hybrid else None
 
+        self.timer.mark("verify")
+
         # ---- 3. accept ----
         sampler_output = None
         if k == 0 and worker_batch.sampling_info is not None and any(needs_plain_sampler(p) for p in params):
@@ -260,6 +318,11 @@ class SpecWorkerBase:
             num_acc = torch.zeros(B, dtype=torch.int64, device=dev)
             corr = so.next_token_ids
             sampler_output = so
+        elif not sampling:
+            # all greedy: rejection sampling reduces to matching the target's argmax
+            best = logits.argmax(dim=-1)                                              # [B, k+1]
+            num_acc = (best[:, :k] == dtoks).long().cumprod(dim=1).sum(dim=1)
+            corr = best.gather(1, num_acc.unsqueeze(1)).squeeze(1)
         else:
             target_probs = processed_probs(logits.reshape(B * (k + 1), -1), [p for p in params for _ in range(k + 1)])
             target_probs = target_probs.view(B, k + 1, -1)
@@ -268,21 +331,46 @@ class SpecWorkerBase:
                 if k > 0:
                     dprobs.scatter_(2, dtoks.unsqueeze(2), 1.0)
             num_acc, corr = rejection_sample(target_probs, dprobs, dtoks, [r.generator for r in reqs])
-        # the round's single device -> host transfer: drafts, acceptance counts, corrections
-        packed = torch.cat([dtoks, num_acc.unsqueeze(1), corr.unsqueeze(1)], dim=1).tolist()
+        # the round's single device -> host transfer: drafts, acceptance counts, corrections;
+        # rank 0's are authoritative, so every rank commits and rolls back the same tokens
+        result = tensor_model_parallel_broadcast(torch.cat([dtoks, num_acc.unsqueeze(1), corr.unsqueeze(1)], dim=1))
+        # All greedy with the verify in a graph: the next round's inputs are on the device already, so
+        # queue the rollback and the next draft now; the host commits tokens while the GPU drafts.
+        pipelined = k > 0 and not sampling and self.verified_in_graph and self.can_prefetch(B)
+        if pipelined:
+            host = torch.empty(result.shape, dtype=result.dtype, pin_memory=True)
+            host.copy_(result, non_blocking=True)
+            copied = torch.cuda.Event()
+            copied.record()
+            if hybrid:
+                self.gdn_layers[0].replay(table_fn(), stash[0], int_tensor([i * (k + 1) for i in range(B)], dev, torch.int32),
+                                          (result[:, k] + 1).to(torch.int32), req_idx.contiguous(), self.pool)
+            self.prefetch_draft(reqs, k, m, req_idx, result[:, k + 1], result[:, k])
+            copied.synchronize()
+            packed = host.tolist()
+        else:
+            packed = result.tolist()
         drafts = [row[:k] for row in packed]
         num_acc_cpu = [row[k] for row in packed]
         accepted = [drafts[i][:num_acc_cpu[i]] + [row[k + 1]] for i, row in enumerate(packed)]
 
+        if pipelined:
+            self.note_prefetch([mi + j + 1 for mi, j in zip(m, num_acc_cpu)])
+        self.timer.mark("accept")
+
         # ---- 4. GDN rollback: replay accepted prefixes from the snapshots (one launch) ----
-        if hybrid and any(j < k for j in num_acc_cpu):
+        if hybrid and not pipelined and any(j < k for j in num_acc_cpu):
             table = table_fn()
-            starts = torch.tensor([i * (k + 1) for i in range(B)], dtype=torch.int32, device=dev)
-            lens = torch.tensor([j + 1 for j in num_acc_cpu], dtype=torch.int32, device=dev)
+            starts = int_tensor([i * (k + 1) for i in range(B)], dev, torch.int32)
+            lens = int_tensor([j + 1 for j in num_acc_cpu], dev, torch.int32)
             self.gdn_layers[0].replay(table, stash[0], starts, lens, req_idx.contiguous(), self.pool)
+
+        self.timer.mark("rollback")
 
         # ---- 5. drafter state from the accepted rows ----
         self.after_accept(reqs, accepted, num_acc_cpu, hidden, aux, slots, m, k, sampling)
+        self.timer.mark("after_accept")
+        self.timer.end_round()
 
         self.rounds += 1
         self.request_rounds += B

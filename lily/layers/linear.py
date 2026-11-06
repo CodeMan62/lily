@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from lily.distributed import get_tp_info, tensor_model_parallel_all_reduce
+from lily.layers.quantization import cuda_ops
 from lily.layers.quantization.base import LinearMethodBase, QuantizationConfig, get_linear_method
 
 
@@ -43,7 +44,7 @@ class ReplicatedLinear(nn.Module):
         self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype), requires_grad=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, self.weight)
+        return cuda_ops.bf16_linear(x, self.weight)
 
 
 class LinearBase(nn.Module):

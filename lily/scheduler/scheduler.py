@@ -1,7 +1,11 @@
 """Scheduler"""
 from __future__ import annotations
 
+import cProfile
+import io
 import logging
+import os
+import pstats
 import queue
 import threading
 import time
@@ -126,9 +130,7 @@ class TpModelWorker:
         if self.spec.rounds % 200 == 0:
             logger.info("speculative decoding: %d rounds, mean accepted length %.2f tokens/round (k=%d)",
                         self.spec.rounds, self.spec.acceptance_length(), self.spec.k)
-        # Ranks agree on the committed tokens: rank 0's acceptance is authoritative.
-        accepted = broadcast_pyobj(res.accepted, self.model_runner.tp_rank, src=0)
-        return GenerationBatchResult(None, None, res.sampler_output, accepted=accepted, spec_slots=res.num_draft + 1)
+        return GenerationBatchResult(None, None, res.sampler_output, accepted=res.accepted, spec_slots=res.num_draft + 1)
 
 
 @dataclass
@@ -721,6 +723,21 @@ class Scheduler:
 # ---- process entry point ---------------------------------------------------
 
 
+MSG_POLL_INTERVAL = 4
+
+
+def _receive_messages(tp_rank: int, poller, recv) -> List:
+    """New requests on rank 0, then the broadcast that gives every rank the same ones in the same order."""
+    msgs: List = []
+    if tp_rank == 0 and dict(poller.poll(timeout=0)).get(recv) == zmq.POLLIN:
+        while True:
+            try:
+                msgs.append(recv.recv_pyobj(zmq.NOBLOCK))
+            except zmq.Again:
+                break
+    return broadcast_pyobj(msgs, tp_rank, src=0)
+
+
 def run_scheduler_process(
     model_config,
     server_args,
@@ -748,19 +765,29 @@ def run_scheduler_process(
     scheduler = Scheduler(model_config, server_args, tp_rank=tp_rank)
     prev = None
     logger.info("scheduler ready (tp rank %d/%d)", tp_rank, server_args.tp_size)
+    prof_every = int(os.environ.get("LILY_SCHED_PROFILE", "0")) if tp_rank == 0 else 0   # cProfile of the loop
+    prof, loops = (cProfile.Profile(), 0) if prof_every else (None, 0)
+    step_count = 0
 
     try:
         while stop_event is None or not stop_event.is_set():
-            msgs: List = []
-            if tp_rank == 0 and dict(poller.poll(timeout=0)).get(recv) == zmq.POLLIN:
-                while True:
-                    try:
-                        msgs.append(recv.recv_pyobj(zmq.NOBLOCK))
-                    except zmq.Again:
-                        break
-            # Lockstep point: every rank sees the same messages in the same
-            # order before scheduling this iteration.
-            msgs = broadcast_pyobj(msgs, tp_rank, src=0)
+            if prof is not None and scheduler.running_batch is not None:
+                loops += 1
+                if loops == 300:
+                    prof.enable()
+                elif loops == 300 + prof_every:
+                    prof.disable()
+                    buf = io.StringIO()
+                    pstats.Stats(prof, stream=buf).sort_stats("tottime").print_stats(28)
+                    logger.info("scheduler loop profile, %d iterations:\n%s", prof_every, buf.getvalue())
+                    prof = None
+            # The lockstep broadcast below is a gloo round trip: while decoding, take new messages
+            # every few iterations only. `running_batch` and the counter agree on every rank.
+            step_count += 1
+            if scheduler.running_batch is not None and step_count % MSG_POLL_INTERVAL:
+                msgs = []
+            else:
+                msgs = _receive_messages(tp_rank, poller, recv)
             for msg in msgs:
                 if isinstance(msg, TokenizedGenerateReqInput):
                     scheduler.add_request(
