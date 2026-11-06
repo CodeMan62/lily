@@ -11,6 +11,7 @@ from typing import Dict, Iterable, List, Optional
 
 import torch
 import zmq
+from torch.profiler import record_function
 
 from lily.scheduler.io_struct import (
     AbortReq,
@@ -26,6 +27,7 @@ from lily.model_executor.forward_batch_info import ForwardBatch
 from lily.model_executor.model_runner import ModelRunner
 from lily.sampling.sampling_params import SamplingParams
 from lily.distributed import broadcast_pyobj, tensor_model_parallel_broadcast
+from lily.profiler import DecodeProfiler
 from lily.utils import int_tensor, new_generator
 
 logger = logging.getLogger(__name__)
@@ -128,82 +130,6 @@ class TpModelWorker:
             logger.info("speculative decoding: %d rounds, mean accepted length %.2f tokens/round (k=%d)",
                         self.spec.rounds, self.spec.acceptance_length(), self.spec.k)
         return GenerationBatchResult(None, None, res.sampler_output, accepted=res.accepted, spec_slots=res.num_draft + 1)
-
-
-class DecodeProfiler:
-    """`LILY_PROFILE_BS=1,8` (+ `LILY_PROFILE_STEPS`, default 20): rank 0 profiles that many consecutive decode
-    steps the first time a batch of each listed size runs, and logs the kernels sorted by GPU time. Kernels
-    inside CUDA-graph replays are reported individually; NCCL kernel time includes the wait for the other ranks."""
-
-    def __init__(self, sizes: List[int], steps: int):
-        self.pending = set(sizes)
-        self.steps = steps
-        self.cpu = bool(os.environ.get("LILY_PROFILE_CPU"))
-        self.prof = None
-        self.bs = 0
-        self.n = 0
-
-    @classmethod
-    def from_env(cls, tp_rank: int) -> Optional["DecodeProfiler"]:
-        spec = os.environ.get("LILY_PROFILE_BS", "")
-        if not spec or tp_rank != 0:
-            return None
-        return cls([int(x) for x in spec.split(",")], int(os.environ.get("LILY_PROFILE_STEPS", "20")))
-
-    def step(self, bs: int) -> None:
-        if self.prof is None:
-            if bs not in self.pending:
-                return
-            self.pending.discard(bs)
-            self.bs, self.n = bs, 0
-            torch.cuda.synchronize()
-            if self.cpu:                    # LILY_PROFILE_CPU=1: the host side (cProfile over whole scheduler iterations)
-                import cProfile
-
-                self.prof = cProfile.Profile()
-                self.prof.enable()
-                self.t0 = time.perf_counter()
-                return
-            from torch.profiler import ProfilerActivity, profile
-
-            self.prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
-            self.prof.__enter__()
-            return
-        self.n += 1
-        if bs != self.bs or self.n >= self.steps:
-            torch.cuda.synchronize()
-            if self.cpu:
-                import io
-                import pstats
-
-                self.prof.disable()
-                wall = (time.perf_counter() - self.t0) / self.n * 1000
-                out = io.StringIO()
-                pstats.Stats(self.prof, stream=out).sort_stats("tottime").print_stats(45)
-                logger.info("host profile of %d scheduler iterations at batch size %d (%.2f ms wall per iteration):\n%s",
-                            self.n, self.bs, wall, out.getvalue())
-            else:
-                self.prof.__exit__(None, None, None)
-                logger.info("profile of %d decode steps at batch size %d (GPU time per step, 'nccl' = collectives incl. waits):\n%s",
-                            self.n, self.bs, self.gpu_table())
-            self.prof = None
-
-    def gpu_table(self, rows: int = 40) -> str:
-        items = []
-        for ev in self.prof.key_averages():
-            t = getattr(ev, "self_device_time_total", None)
-            if t is None:
-                t = ev.self_cuda_time_total
-            if t > 0 and ev.device_type.name != "CPU":
-                items.append((t / self.n / 1000.0, ev.count / self.n, ev.key))
-        items.sort(reverse=True)
-        total = sum(t for t, _, _ in items)
-        graphs = sum(ev.count for ev in self.prof.key_averages() if ev.key == "cudaGraphLaunch") / self.n
-        lines = [f"{'ms/step':>8} {'%':>5} {'calls':>6}  kernel",
-                 f"{total:8.3f} {100:5.1f} {'':>6}  total GPU time per step ({graphs:.1f} CUDA-graph launches per step)"]
-        for t, n, name in items[:rows]:
-            lines.append(f"{t:8.3f} {100 * t / total:5.1f} {n:6.1f}  {name[:90]}")
-        return "\n".join(lines)
 
 
 @dataclass
@@ -770,11 +696,14 @@ class Scheduler:
     def step(self) -> bool:
         """Run one scheduler step. Returns False when there is nothing to do."""
         self._overlap_loop = False
-        batch = self.get_next_batch_to_run()
+        with record_function("lily.schedule"):
+            batch = self.get_next_batch_to_run()
         if batch is None or not batch.reqs:
             return False
-        result = self.run_batch(batch)
-        self.process_batch_result(batch, result)
+        with record_function("lily.forward"):
+            result = self.run_batch(batch)
+        with record_function("lily.commit"):
+            self.process_batch_result(batch, result)
         return True
 
     def overlap_step(self, prev):
@@ -828,7 +757,8 @@ def _receive_messages(tp_rank: int, poller, recv) -> List:
                 msgs.append(recv.recv_pyobj(zmq.NOBLOCK))
             except zmq.Again:
                 break
-    return broadcast_pyobj(msgs, tp_rank, src=0)
+    with record_function("lily.broadcast_requests"):
+        return broadcast_pyobj(msgs, tp_rank, src=0)
 
 
 def run_scheduler_process(
@@ -891,6 +821,7 @@ def run_scheduler_process(
                 except Exception:
                     break
             if outs and tp_rank == 0:
+              with record_function("lily.outputs"):
                 send.send_pyobj(BatchTokenIDOut(
                     rids=[o.rid for o in outs],
                     output_ids=[o.new_token_ids for o in outs],

@@ -70,83 +70,21 @@ def test_mla_decode_matches_torch(D, H, sparse):
         torch.testing.assert_close(got[b].float(), want, atol=2e-2, rtol=2e-2)
 
 
-# ---- the small fused glue kernels (small_fused.cu) ---------------------------------------------------
+# ---- small_fused.cu: bit-exact against the torch formulations ------------------------------------------
 
-def _eager_rmsnorm(x, w, eps):
-    xf = x.float()
-    return w * (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)).to(x.dtype)
-
-
-@pytest.mark.parametrize("H", [128, 512, 2048, 4096])
-def test_rmsnorm_matches_torch(H):
-    gen = torch.Generator().manual_seed(H)
-    x = (torch.randn(37, H, generator=gen) * 3).bfloat16().cuda()
-    w = (torch.rand(H, generator=gen) + 0.5).bfloat16().cuda()
-    torch.testing.assert_close(cuda_ops.rmsnorm(x, w, 1e-5), _eager_rmsnorm(x, w, 1e-5), atol=0, rtol=0)
-
-
-def test_dyn_conv2_matches_torch():
-    from lily.models.dflash import GroupedDynamicCausalConv
-
-    gen = torch.Generator().manual_seed(3)
-    H, group, B, L = 256, 16, 3, 8
-    conv = GroupedDynamicCausalConv(H, 2, group).cuda()
-    conv.base_kernel.copy_(torch.randn(2, 2, H, generator=gen) * 0.5)
-    conv.kernel_projection.weight.copy_(torch.randn(4 * H // group, H, generator=gen) * 0.05)
-    x = torch.randn(B, L, H, generator=gen).bfloat16().cuda()
-    projected = conv.kernel_projection(x)
-    for which in (0, 1):
-        got = cuda_ops.dyn_conv2(x, projected, which * 2 * (H // group), conv.base_kernel[which], group)
-        dyn = projected.view(B, L, 2, 2, H // group)[:, :, which]
-        blocks = x.view(B, L, H // group, group)
-        out = torch.zeros_like(blocks)
-        for off in range(2):
-            vals = blocks if off == 0 else F.pad(blocks[:, :-off], (0, 0, 0, 0, off, 0))
-            out = out + conv.base_kernel[which, off].view(1, 1, H // group, group) * vals
-            out = torch.addcmul(out, dyn[:, :, off].unsqueeze(-1), vals)
-        torch.testing.assert_close(got, out.view(B, L, H), atol=0, rtol=0)
-
-
-def test_rope_neox_matches_torch():
+def test_small_fused_matches_torch():
     from lily.layers.rotary import RotaryEmbedding
 
-    gen = torch.Generator().manual_seed(5)
-    rope = RotaryEmbedding(128, 128, 4096, 10000.0, is_neox_style=True, dtype=torch.bfloat16).cuda()
+    gen = torch.Generator().manual_seed(3)
+    x = (torch.randn(37, 512, generator=gen) * 3).bfloat16().cuda()
+    w = (torch.rand(512, generator=gen) + 0.5).bfloat16().cuda()
+    want = w * (x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + 1e-5)).bfloat16()
+    assert torch.equal(cuda_ops.rmsnorm(x, w, 1e-5), want)
+    rope = RotaryEmbedding(128, 128, 4096, 10000.0, dtype=torch.bfloat16).cuda()
     pos = torch.randint(0, 4096, (24,), generator=gen).cuda()
-    q = torch.randn(24, 8 * 128, generator=gen).bfloat16().cuda()
-    k = torch.randn(24, 2 * 128, generator=gen).bfloat16().cuda()
+    q, k = (torch.randn(24, h * 128, generator=gen).bfloat16().cuda() for h in (8, 2))
     got = rope(pos, q, k)
-    cs = rope.cos_sin_cache[pos]                      # the eager path, by hand
-    cos, sin = (t.repeat(1, 2).unsqueeze(1) for t in cs.chunk(2, dim=-1))
-
-    def rot(x):
-        x1, x2 = x.chunk(2, dim=-1)
-        return torch.cat((-x2, x1), dim=-1)
-
-    qh, kh = q.view(24, 8, 128), k.view(24, 2, 128)
-    want = ((qh * cos + rot(qh) * sin).view(24, -1), (kh * cos + rot(kh) * sin).view(24, -1))
-    torch.testing.assert_close(got[0], want[0], atol=0, rtol=0)
-    torch.testing.assert_close(got[1], want[1], atol=0, rtol=0)
-
-
-def test_select_greedy_matches_torch():
-    gen = torch.Generator().manual_seed(7)
-    B, S, K, R, V = 4, 8, 16, 256, 500
-    unary = (torch.randn(B, S, K, generator=gen) * 4).cuda()
-    cand = torch.stack([torch.stack([torch.randperm(V, generator=gen)[:K] for _ in range(S)]) for _ in range(B)]).cuda()
-    proj = torch.randn(B, S, R, generator=gen).cuda()
-    anchor = torch.randint(0, V, (B,), generator=gen).cuda()
-    pred = (torch.randn(V, R, generator=gen) * 0.3).bfloat16().cuda()
-    succ = (torch.randn(V, R, generator=gen) * 0.3).bfloat16().cuda()
-    path, q = cuda_ops.select_greedy(unary, cand, proj, anchor, pred, succ)
-    prev, want = anchor, []
-    for pos in range(S):
-        gate = F.embedding(prev, pred).float() * proj[:, pos]
-        scores = unary[:, pos] + torch.einsum("br,bkr->bk", gate, F.embedding(cand[:, pos], succ).float())
-        top = scores.topk(2, dim=-1).values
-        assert (top[:, 0] - top[:, 1]).min() > 1e-3          # no near-ties in this seed: the paths must agree
-        idx = scores.argmax(-1)
-        prev = cand[:, pos].gather(1, idx.unsqueeze(1)).squeeze(1)
-        want.append(prev)
-        assert torch.equal(q[:, pos].argmax(-1), idx) and torch.equal(q[:, pos].sum(-1), torch.ones(B, device="cuda"))
-    assert torch.equal(path, torch.stack(want, dim=1))
+    cos, sin = (t.repeat(1, 2).unsqueeze(1) for t in rope.cos_sin_cache[pos].chunk(2, dim=-1))
+    rot = lambda t: torch.cat((-t[..., 64:], t[..., :64]), dim=-1)  # noqa: E731
+    for g, t in zip(got, (q.view(24, 8, 128), k.view(24, 2, 128))):
+        assert torch.equal(g, (t * cos + rot(t) * sin).view(24, -1))

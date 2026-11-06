@@ -169,36 +169,33 @@ def l2_prefetch(w: torch.Tensor) -> None:
     _module().l2_prefetch(w, 32)
 
 
+def _bf16_cuda(*tensors) -> bool:
+    return _module() is not None and all(t.is_cuda and t.dtype == torch.bfloat16 for t in tensors)
+
+
 def rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float) -> Optional[torch.Tensor]:
-    """w * bf16(x * rsqrt(mean(x^2) + eps)) over the last dim of a bf16 tensor; None when unavailable."""
-    mod = _module()
-    if mod is None or not x.is_cuda or x.dtype != torch.bfloat16 or w.dtype != torch.bfloat16 or x.shape[-1] % 8:
+    """w * bf16(x * rsqrt(mean(x^2) + eps)) over the last dim; None when unavailable."""
+    if not _bf16_cuda(x, w) or x.shape[-1] % 8:
         return None
-    rows = x.numel() // x.shape[-1]
-    return mod.rmsnorm_fused(x.reshape(rows, -1).contiguous(), w, float(eps)).view(x.shape)
+    return _module().rmsnorm_fused(x.reshape(-1, x.shape[-1]).contiguous(), w, float(eps)).view(x.shape)
 
 
 def dyn_conv2(x: torch.Tensor, dyn: torch.Tensor, dyn_off: int, base: torch.Tensor, group: int) -> Optional[torch.Tensor]:
-    """The DFlash drafter's two-tap conv: x [B, L, H] bf16, dyn [B, L, D] (the taps' per-group kernels at
-    columns dyn_off.. laid out [2, H/group]), base [2, H]. None when unavailable."""
-    mod = _module()
-    if mod is None or not x.is_cuda or x.dtype != torch.bfloat16 or dyn.dtype != torch.bfloat16 or x.shape[-1] % 8 or group % 8:
+    """DFlash two-tap conv: x [B, L, H], dyn [B, L, D] with the taps' per-group kernels at columns dyn_off.., base [2, H]."""
+    if not _bf16_cuda(x, dyn) or x.shape[-1] % 8 or group % 8:
         return None
-    return mod.dyn_conv2(x.contiguous(), dyn, int(dyn_off), base.contiguous(), int(group))
+    return _module().dyn_conv2(x.contiguous(), dyn, int(dyn_off), base.contiguous(), int(group))
 
 
 def rope_neox(q: torch.Tensor, k: torch.Tensor, cos_sin: torch.Tensor, positions: torch.Tensor):
-    """Rotate q [N, Hq, D] and k [N, Hk, D] (bf16, rotary over the whole head) -> (q, k) copies; None when unavailable."""
-    mod = _module()
-    if (mod is None or not q.is_cuda or q.dtype != torch.bfloat16 or k.dtype != torch.bfloat16 or cos_sin.dtype != torch.bfloat16
-            or positions.dtype != torch.int64 or q.shape[-1] % 2):
+    """Rotate q [N, Hq, D] and k [N, Hk, D] over the whole head -> (q, k) copies; None when unavailable."""
+    if not _bf16_cuda(q, k, cos_sin) or positions.dtype != torch.int64 or q.shape[-1] % 2:
         return None
-    return mod.rope_neox(q.contiguous(), k.contiguous(), cos_sin, positions.contiguous())
+    return _module().rope_neox(q.contiguous(), k.contiguous(), cos_sin, positions.contiguous())
 
 
-def select_greedy(unary: torch.Tensor, cand: torch.Tensor, proj: torch.Tensor, anchor: torch.Tensor,
-                  pred_cb: torch.Tensor, succ_cb: torch.Tensor):
-    """The DFlash candidate selector's greedy path -> (path [B, S] int64, one-hot q [B, S, K] fp32); None when unavailable."""
+def select_greedy(unary, cand, proj, anchor, pred_cb, succ_cb):
+    """DFlash greedy candidate path -> (path [B, S] int64, one-hot q [B, S, K] fp32); None when unavailable."""
     mod = _module()
     if mod is None or not unary.is_cuda or not mod.select_greedy_supported(unary.shape[-1], proj.shape[-1]):
         return None

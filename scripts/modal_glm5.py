@@ -193,12 +193,14 @@ def lossless(spec: str = "dflash", output_len: int = 256, k: int = 5) -> None:
 @app.function(image=image, volumes={"/models": vol}, gpu=GPU, cpu=16, memory=65536, timeout=22 * 60)
 def bench(input_len: int = 256, output_len: int = 256, concurrency: str = "1,8", health_timeout: int = 12 * 60,
           spec: str = "", k: int = 0, random_prompts: bool = True, profile_bs: str = "", nccl_debug: bool = False,
-          graph_bs: int = 8, sweep_passes: int = 1, env: str = "") -> dict:
+          graph_bs: int = 8, sweep_passes: int = 1, env: str = "", profile_trace: bool = False) -> dict:
     """`spec`: "" plain decode, "dflash" the DFlash 2 drafter (Volume), "mtp" the checkpoint's MTP head.
     `profile_bs`: e.g. "1,8": rank 0 logs a per-kernel GPU-time table of 20 decode steps at those batch sizes.
     `nccl_debug`: log NCCL's transport choice (P2P vs shared memory) at startup. `graph_bs`: CUDA-graph
     batch-size cap (decode, verify and draft graphs); set it to the largest concurrency level. `sweep_passes`:
-    repeat the real-prompt sweep (the profiler slows the first pass); `env`: "K=V,K=V" for the server."""
+    repeat the real-prompt sweep (the profiler slows the first pass); `env`: "K=V,K=V" for the server;
+    `profile_trace`: with `profile_bs`, every rank also writes a chrome trace of its window to the Volume
+    (results/trace-bs<N>-rank<R>-<time>.json), summarised offline by `bench/profile_report.py`."""
     import httpx
 
     sys.path.insert(0, "/app")
@@ -209,6 +211,9 @@ def bench(input_len: int = 256, output_len: int = 256, concurrency: str = "1,8",
     log_path = "/tmp/lily-serve.log"
     if profile_bs:
         os.environ["LILY_PROFILE_BS"] = profile_bs
+        if profile_trace:                      # chrome traces -> Volume results/; `modal volume get lily-models results/<name>`
+            os.environ["LILY_PROFILE_TRACE"] = "/models/results"
+            os.environ["LILY_PROFILE_ALL_RANKS"] = "1"
     if nccl_debug:
         os.environ["NCCL_DEBUG"] = "INFO"
         os.environ["NCCL_DEBUG_SUBSYS"] = "INIT"
