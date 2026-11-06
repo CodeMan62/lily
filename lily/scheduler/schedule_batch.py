@@ -18,7 +18,7 @@ import torch
 from lily.model_executor.forward_batch_info import ForwardMode
 from lily.sampling.sampling_batch_info import SamplingBatchInfo
 from lily.sampling.sampling_params import SamplingParams
-from lily.utils import new_generator
+from lily.utils import int_tensor, new_generator
 
 
 @dataclass
@@ -279,16 +279,16 @@ class ScheduleBatch:
             seq_lens.append(prefix + n)
         self.forward_mode = ForwardMode.DECODE
         self.spec_num_draft = num_draft
-        self.input_ids = torch.tensor([r.output_ids[-1] for r in self.reqs], dtype=torch.int64, device=self.device)
-        self.positions = torch.tensor([r.seq_len for r in self.reqs], dtype=torch.int64, device=self.device)
-        self.req_pool_indices = torch.tensor([r.req_pool_idx for r in self.reqs], dtype=torch.int64, device=self.device)
-        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=self.device)
+        self.input_ids = int_tensor([r.output_ids[-1] for r in self.reqs], self.device)
+        self.positions = int_tensor([r.seq_len for r in self.reqs], self.device)
+        self.req_pool_indices = int_tensor([r.req_pool_idx for r in self.reqs], self.device)
+        self.seq_lens = int_tensor(seq_lens, self.device)
         self.out_cache_loc = out_loc
         self.seq_lens_cpu = seq_lens
         self.extend_seq_lens_cpu = [n] * len(self.reqs)
         self.extend_prefix_lens_cpu = [r.seq_len for r in self.reqs]
-        self.extend_seq_lens = torch.tensor(self.extend_seq_lens_cpu, dtype=torch.int64, device=self.device)
-        self.extend_prefix_lens = torch.tensor(self.extend_prefix_lens_cpu, dtype=torch.int64, device=self.device)
+        self.extend_seq_lens = int_tensor(self.extend_seq_lens_cpu, self.device)
+        self.extend_prefix_lens = int_tensor(self.extend_prefix_lens_cpu, self.device)
         self.extend_start_loc = torch.arange(0, n * len(self.reqs), n, dtype=torch.int64, device=self.device)
         self.extend_num_tokens = n * len(self.reqs)
         self.seq_lens_sum = sum(seq_lens)

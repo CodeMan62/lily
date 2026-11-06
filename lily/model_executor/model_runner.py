@@ -74,7 +74,7 @@ class ModelRunner:
 
             self.drafter = DFlash2Drafter.load(resolve_draft_path(server_args.speculative_draft_model_path),
                                                model_config.hidden_size, self.device)
-            if server_args.speculative_num_steps != self.drafter.num_drafts:
+            if server_args.speculative_num_steps > self.drafter.num_drafts:
                 logger.warning("DFLASH drafts a block of %d: speculative_num_steps %s -> %d",
                                self.drafter.block_size, server_args.speculative_num_steps, self.drafter.num_drafts)
                 server_args.speculative_num_steps = self.drafter.num_drafts

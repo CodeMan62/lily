@@ -195,6 +195,78 @@ def test_mtp_speculative_decoding_matches_plain():
     free_cuda()
 
 
-def test_tp2_matches_tp1(check):
+def test_tp2_matches_tp1():
+    check = SmallGlm5(path="/tmp/opencode/small-glm5-tp2", moe_i=256)
     _, margin = check.logits(IDS[:20])
     assert_tp2_matches_tp1(str(check.path), IDS[:20], 6, margin >= SmallGlm5.ROUTING_TIE, atol=0.3)
+
+
+def test_fused_hyper_connection_matches_torch():
+    """The fused collapse / expand against the torch formulation, on realistic stream magnitudes."""
+    from lily.layers.layernorm import RMSNorm
+    from lily.models.glm5_flash import HyperConnection
+
+    torch.manual_seed(0)
+    H, T = 512, 7
+    hc = HyperConnection(H, 4, 20, 1e-6, 1e-5).cuda()
+    hc.fn.data.normal_(0, 0.05)
+    hc.base.data.normal_(0, 0.5)
+    hc.scale.data.uniform_(0.5, 1.5)
+    norm = RMSNorm(H, eps=1e-5).to("cuda", torch.bfloat16)
+    norm.weight.data.uniform_(0.5, 1.5)
+    streams = torch.randn(T, 4, H, dtype=torch.bfloat16, device="cuda") * 3
+    block = torch.randn(T, H, dtype=torch.bfloat16, device="cuda")
+    assert hc.fused
+    post, comb, normed = hc.collapse_norm(streams, norm)
+    rpost, rcomb, rcollapsed = hc.collapse(streams)
+    torch.testing.assert_close(post, rpost, atol=2e-4, rtol=1e-3)
+    torch.testing.assert_close(comb, rcomb, atol=2e-4, rtol=1e-3)
+    torch.testing.assert_close(normed.float(), norm(rcollapsed).float(), atol=0.04, rtol=0.02)
+    got = HyperConnection.expand(block, rpost, rcomb, streams)
+    ref = rpost.to(streams.dtype).unsqueeze(-1) * block.unsqueeze(1) + torch.matmul(rcomb.to(streams.dtype).transpose(-1, -2), streams)
+    torch.testing.assert_close(got.float(), ref.float(), atol=0.07, rtol=0.02)
+
+
+def test_fused_moe_routing_matches_torch():
+    """The route kernel's selection, weights and CSR, and the fused layer against the torch layer."""
+    from lily.layers.moe import NVFP4MoE, TopkRouter, sort_by_expert
+
+    torch.manual_seed(0)
+    T, E, k, off, local = 9, 32, 4, 8, 8
+    router = TopkRouter(64, E, k, 2.5).cuda()
+    router.weight.data.normal_(0, 0.5)
+    router.e_score_correction_bias.data.normal_(0, 0.1)
+    x = torch.randn(T, 64, device="cuda", dtype=torch.bfloat16)
+    ref_w, ref_ids = router(x)
+    logits = F.linear(x.float(), router.weight)
+    w, active, offsets, tokens, inv = cuda_ops.moe_route(logits, router.e_score_correction_bias, k, 2.5, True, off, local)
+    order = ref_ids.sort(dim=1).indices
+    # weights are per selected expert: compare as (expert -> weight) maps, slots may be ordered differently
+    ids_sorted = ref_ids.gather(1, order)
+    ref_sorted = ref_w.gather(1, order)
+    local_ids = (ids_sorted - off).masked_fill((ids_sorted < off) | (ids_sorted >= off + local), local)
+    a, o, t, _ = sort_by_expert(local_ids, local + 1)
+    assert offsets.tolist() == o[:local + 1].tolist()
+    assert sorted(active[active >= 0].tolist()) == sorted(a[(a >= 0) & (a < local)].tolist())
+    n = int(offsets[local])
+    assert sorted(tokens[:n].tolist()) == sorted(t[:n].tolist())
+    assert (inv >= 0).sum() == n and sorted(inv[inv >= 0].tolist()) == list(range(n))
+    torch.testing.assert_close(w.sort(dim=1).values, ref_sorted.sort(dim=1).values, atol=1e-5, rtol=1e-5)
+    assert isinstance(NVFP4MoE.SMALL_BATCH, int)
+
+
+@pytest.mark.parametrize("M,N,K", [(1, 6144, 4096), (3, 1000, 1536), (8, 256, 128), (8, 4096, 2048)])
+def test_bf16_skinny_matches_cublas(M, N, K):
+    torch.manual_seed(0)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    w = torch.randn(N, K, dtype=torch.bfloat16, device="cuda") * 0.05
+    got = cuda_ops.bf16_linear(x, w)
+    torch.testing.assert_close(got.float(), F.linear(x.float(), w.float()), atol=0.08, rtol=0.02)
+
+
+@pytest.mark.parametrize("rows", [1, 6, 8])
+def test_router_logits_matches_fp32_linear(rows):
+    torch.manual_seed(0)
+    x = torch.randn(rows, 1024, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(288, 1024, device="cuda")
+    torch.testing.assert_close(cuda_ops.router_logits(x, w), F.linear(x.float(), w), rtol=1e-4, atol=1e-3)

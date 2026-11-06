@@ -4,6 +4,8 @@
     modal run scripts/modal_glm5.py::check_load   # CPU only: one rank's slice loads with 0 missing params
     modal run scripts/modal_glm5.py::bench        # 4x RTX PRO 6000 ($3.03/h each): serve, check one
                                                   # reply, measure tok/s at concurrency 1 and 8, exit
+    modal run scripts/modal_glm5.py::profile      # 4x RTX PRO 6000: per-kernel decode step breakdown
+    modal run scripts/modal_glm5.py::test         # 2x RTX PRO 6000: the GLM test suite on tiny models
 
 The image compiles lily's CUDA kernels for sm_120 at build time (CPU, no GPU billed), so the GPU
 run only loads weights (~5 min), warms up and benchmarks. `bench` is hard-capped by its timeout.
@@ -24,6 +26,9 @@ import modal
 ROOT = Path(__file__).resolve().parent.parent
 MODEL_REPO = "nvidia/GLM-5.3-Flash-NVFP4"
 MODEL_DIR = "/models/glm53-flash-nvfp4"
+DRAFT_REPO = "incoai/GLM-5.3-Flash-DFlash2"
+DRAFT_REVISION = "bf582e4eacc1810f76656d1811693ff6c6737d2a"
+DRAFT_DIR = "/models/glm53-flash-dflash2"
 GPU = "RTX-PRO-6000:4"
 GPU_HOUR_USD = 4 * 3.03
 PORT = 30000
@@ -31,7 +36,8 @@ PORT = 30000
 app = modal.App("lily-glm53-flash")
 vol = modal.Volume.from_name("lily-models", create_if_missing=True)
 
-build_env = {"TORCH_CUDA_ARCH_LIST": "12.0", "LILY_CUDA_BUILD_DIR": "/opt/lily-cuda", "CUDA_HOME": "/usr/local/cuda",
+build_env = {"LILY_SPEC_TIMING": os.environ.get("LILY_SPEC_TIMING", ""), "LILY_SCHED_PROFILE": os.environ.get("LILY_SCHED_PROFILE", "0"),
+             "TORCH_CUDA_ARCH_LIST": "12.0", "LILY_CUDA_BUILD_DIR": "/opt/lily-cuda", "CUDA_HOME": "/usr/local/cuda",
              "TOKENIZERS_PARALLELISM": "false"}
 
 image = (
@@ -46,6 +52,8 @@ image = (
         " && uv pip install --system -r /app/requirements.txt")
     .add_local_dir(ROOT / "lily", "/app/lily", copy=True, ignore=["__pycache__", "*.pyc"])
     .add_local_dir(ROOT / "bench", "/app/bench", copy=True, ignore=["__pycache__", "logs", "results"])
+    .add_local_dir(ROOT / "tests", "/app/tests", copy=True, ignore=["__pycache__"])
+    .add_local_file(ROOT / "scripts" / "quantize_nvfp4.py", "/app/scripts/quantize_nvfp4.py", copy=True)
     .add_local_file(ROOT / "README.md", "/app/README.md", copy=True)
     .run_commands(
         "cd /app && uv pip install --system --no-deps -e /app",
@@ -68,6 +76,7 @@ def download() -> dict:
     env = {**os.environ, "HF_XET_HIGH_PERFORMANCE": "1"}
     env.pop("HF_HUB_ENABLE_HF_TRANSFER", None)
     subprocess.run(cmd, check=True, env=env)
+    subprocess.run(["hf", "download", DRAFT_REPO, "--revision", DRAFT_REVISION, "--local-dir", DRAFT_DIR], check=True, env=env)
     vol.commit()
     shards = sorted(p.name for p in Path(MODEL_DIR).glob("*.safetensors"))
     index = json.load(open(f"{MODEL_DIR}/model.safetensors.index.json"))["weight_map"]
@@ -98,8 +107,95 @@ def _generate_probe(base: str) -> bool:
         return False
 
 
+def _start_server(spec: str, log_path: str, t0: float, k: int = 0) -> subprocess.Popen:
+    cmd = ["lily-serve", "--model-path", MODEL_DIR, "--served-model-name", "glm", "--tp-size", "4",
+           "--quantize-lm-head", "nvfp4", "--mamba-ssm-dtype", "bfloat16", "--context-length", "32768",
+           "--max-running-requests", "16", "--max-total-tokens", "131072", "--cuda-graph-max-bs", "8",
+           "--mem-fraction-static", "0.8", "--port", str(PORT)]
+    if spec == "dflash":
+        cmd += ["--speculative-algorithm", "DFLASH", "--speculative-draft-model-path", DRAFT_DIR]
+    elif spec:
+        cmd += ["--speculative-algorithm", spec.upper()]
+    if k:
+        cmd += ["--speculative-num-steps", str(k), "--speculative-num-draft-tokens", str(k + 1)]
+    print(" ".join(cmd), flush=True)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+    threading.Thread(target=_tee, args=(proc, log_path, t0), daemon=True).start()
+    return proc
+
+
+def _wait_ready(proc: subprocess.Popen, base: str, log_path: str, t0: float, timeout: int) -> None:
+    """Until a real request is served; aborts early on a crash."""
+    while True:
+        if proc.poll() is not None:
+            raise RuntimeError(f"lily-serve exited with {proc.returncode}")
+        if os.path.exists(log_path) and "Traceback" in open(log_path, errors="replace").read():
+            time.sleep(3)
+            raise RuntimeError("a lily-serve process crashed during startup (see [serve] log above)")
+        if _generate_probe(base):
+            return
+        if time.time() - t0 > timeout:
+            raise RuntimeError(f"server not healthy after {timeout}s")
+        time.sleep(5.0)
+
+
+def _stop_server(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(os.getpgid(proc.pid), 9)
+    except ProcessLookupError:
+        pass
+    proc.wait()
+    time.sleep(3)      # the GPUs' memory comes back after the ranks are reaped
+
+
+def _real_prompts() -> list:
+    from transformers import AutoTokenizer
+
+    sys.path.insert(0, "/app")
+    from bench.bench import REAL_PROMPTS
+
+    tok = AutoTokenizer.from_pretrained(MODEL_DIR)
+    return [list(tok.apply_chat_template([{"role": "user", "content": p}], add_generation_prompt=True, tokenize=True,
+                                         return_dict=True)["input_ids"]) for p in REAL_PROMPTS]
+
+
+@app.function(image=image, volumes={"/models": vol}, gpu=GPU, cpu=16, memory=65536, timeout=20 * 60)
+def lossless(spec: str = "dflash", output_len: int = 256) -> None:
+    """Greedy speculative output vs the target's own argmax, with a plain run as the noise floor."""
+    import httpx
+
+    base = f"http://127.0.0.1:{PORT}"
+    prompts = _real_prompts()
+    runs = {}
+    for name in ("plain", spec):
+        t0 = time.time()
+        proc = _start_server("" if name == "plain" else spec, f"/tmp/lily-{name}.log", t0)
+        try:
+            _wait_ready(proc, base, f"/tmp/lily-{name}.log", t0, 12 * 60)
+            pairs = []
+            for ids in prompts:
+                out = []
+                body = {"input_ids": ids, "stream": True,
+                        "sampling_params": {"max_new_tokens": output_len, "ignore_eos": True, "temperature": 0.0}}
+                with httpx.stream("POST", f"{base}/generate", json=body, timeout=600) as resp:
+                    for line in resp.iter_lines():
+                        if line.startswith("data: ") and line != "data: [DONE]":
+                            out += json.loads(line[6:]).get("meta_info", {}).get("output_ids", [])
+                assert len(out) == output_len, len(out)
+                pairs.append([ids, out])
+            runs[name] = pairs
+        finally:
+            _stop_server(proc)
+    same = [next((i for i, (a, b) in enumerate(zip(p[1], q[1])) if a != b), output_len) for p, q in zip(runs["plain"], runs[spec])]
+    print(f"=== first plain/{spec} difference per prompt: {same}", flush=True)
+    json.dump(runs, open("/tmp/runs.json", "w"))
+    subprocess.run([sys.executable, "/app/bench/check_greedy.py", "--model-path", MODEL_DIR, "--runs", "/tmp/runs.json"], check=True)
+
+
 @app.function(image=image, volumes={"/models": vol}, gpu=GPU, cpu=16, memory=65536, timeout=22 * 60)
-def bench(input_len: int = 256, output_len: int = 128, concurrency: str = "1,8", health_timeout: int = 12 * 60) -> dict:
+def bench(input_len: int = 256, output_len: int = 256, concurrency: str = "1,8", health_timeout: int = 12 * 60,
+          spec: str = "", k: int = 0) -> dict:
+    """`spec`: "" plain decode, "dflash" the DFlash 2 drafter (Volume), "mtp" the checkpoint's MTP head."""
     import httpx
 
     sys.path.insert(0, "/app")
@@ -108,27 +204,10 @@ def bench(input_len: int = 256, output_len: int = 128, concurrency: str = "1,8",
     t_start = time.time()
     base = f"http://127.0.0.1:{PORT}"
     log_path = "/tmp/lily-serve.log"
-    cmd = ["lily-serve", "--model-path", MODEL_DIR, "--served-model-name", "glm", "--tp-size", "4",
-           "--quantize-lm-head", "nvfp4", "--mamba-ssm-dtype", "bfloat16", "--context-length", "32768",
-           "--max-running-requests", "16", "--max-total-tokens", "131072", "--cuda-graph-max-bs", "8",
-           "--mem-fraction-static", "0.8", "--port", str(PORT)]
-    print(" ".join(cmd), flush=True)
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
-    threading.Thread(target=_tee, args=(proc, log_path, t_start), daemon=True).start()
-    result: dict = {"gpu": GPU}
+    proc = _start_server(spec, log_path, t_start, k)
+    result: dict = {"gpu": GPU, "spec": spec, "k": k}
     try:
-        # ---- wait until a real request is served; abort early on a crash ----
-        while True:
-            if proc.poll() is not None:
-                raise RuntimeError(f"lily-serve exited with {proc.returncode}")
-            if os.path.exists(log_path) and "Traceback" in open(log_path, errors="replace").read():
-                time.sleep(3)
-                raise RuntimeError("a lily-serve process crashed during startup (see [serve] log above)")
-            if _generate_probe(base):
-                break
-            if time.time() - t_start > health_timeout:
-                raise RuntimeError(f"server not healthy after {health_timeout}s")
-            time.sleep(5.0)
+        _wait_ready(proc, base, log_path, t_start, health_timeout)
         result["startup_s"] = round(time.time() - t_start)
         print(f"\n=== server ready after {result['startup_s']}s ===\n", flush=True)
 
@@ -150,25 +229,24 @@ def bench(input_len: int = 256, output_len: int = 128, concurrency: str = "1,8",
 
         vocab = 154880
         url = f"{base}/generate"
-        rows = []
+        real = _real_prompts()
+        levels = [int(x) for x in concurrency.split(",")]
 
-        async def go():
+        async def sweep(name, make):
+            rows = []
             async with httpx.AsyncClient() as client:
-                await _one_request(client, url, _random_ids(input_len, vocab, seed=7), output_len)   # warmup
-                for c in [int(x) for x in concurrency.split(",")]:
-                    prompts = [_random_ids(input_len, vocab, seed=10_000 + i) for i in range(max(8, c))]
-                    row = await _sweep_level(client, url, prompts, output_len, c)
+                await _one_request(client, url, make(0), output_len)   # warmup
+                for c in levels:
+                    row = await _sweep_level(client, url, [make(i) for i in range(max(8, c))], output_len, c)
                     rows.append(row)
-                    print("  " + _http_line(row), flush=True)
+                    print(f"  [{name}] " + _http_line(row), flush=True)
+            print("\n" + http_table(rows) + "\n", flush=True)
+            return [row.__dict__ for row in rows]
 
-        asyncio.run(go())
-        print("\n" + http_table(rows) + "\n", flush=True)
-        result["http"] = [row.__dict__ for row in rows]
+        result["http_real"] = asyncio.run(sweep("real", lambda i: real[i % len(real)]))
+        result["http"] = asyncio.run(sweep("random", lambda i: _random_ids(input_len, vocab, seed=10_000 + i)))
     finally:
-        try:
-            os.killpg(os.getpgid(proc.pid), 9)
-        except ProcessLookupError:
-            pass
+        _stop_server(proc)
         total = time.time() - t_start
         result["total_s"] = round(total)
         result["est_cost_usd"] = round(total / 3600 * GPU_HOUR_USD, 2)
@@ -183,6 +261,17 @@ def bench(input_len: int = 256, output_len: int = 128, concurrency: str = "1,8",
             print(f"could not save results: {exc}", flush=True)
     return result
 
+
+
+@app.function(image=image, volumes={"/models": vol}, gpu=GPU, cpu=16, memory=65536, timeout=15 * 60)
+def profile(bs: int = 1, verify: int = 7, server_args: str = "{}") -> None:
+    subprocess.run([sys.executable, "/app/bench/profile_decode.py", "--model-path", MODEL_DIR, "--tp", "4", "--bs", str(bs),
+                    "--verify", str(verify), "--server-args", server_args], check=True)
+
+
+@app.function(image=image, gpu="RTX-PRO-6000:2", cpu=8, memory=32768, timeout=15 * 60)
+def test(target: str = "tests/test_glm5.py") -> None:
+    subprocess.run([sys.executable, "-m", "pytest", "-x", "-q", *target.split()], check=True, cwd="/app")
 
 
 @app.function(image=image, volumes={"/models": vol}, cpu=8, memory=98304, timeout=3600)

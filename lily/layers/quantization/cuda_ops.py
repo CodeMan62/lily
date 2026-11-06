@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 _CSRC = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "csrc")
 _SOURCES = [os.path.join(_CSRC, f) for f in ("bindings.cpp", "nvfp4_gemv.cu", "nvfp4_gemm_tc.cu", "nvfp4_moe.cu", "gdn_fused.cu",
-                                                "kda_fused.cu", "mla_decode.cu")]
+                                                "kda_fused.cu", "mla_decode.cu", "hc_fused.cu", "moe_fused.cu", "bf16_skinny.cu")]
 
 # Row-count routing for NVFP4 linears: the CUDA-core GEMV streams weights at HBM
 # bandwidth up to 4 rows; 5..16 rows go to the tensor-core GEMM (one dequant per
@@ -161,6 +161,27 @@ def kda_fused_replay(table, proj_stride: int, beta_stride: int, fgate_stride: in
                                tok_starts, tok_lens, slots, int(num_heads), int(head_dim), int(kernel_size), state_dtype)
 
 
+# ---- bf16 linears of decode and verify batches ---------------------------------------------
+
+def bf16_linear(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """x @ w^T: the weight-streaming kernel for small batches, cuBLAS otherwise."""
+    mod = _module()
+    rows = x.numel() // x.shape[-1] if x.shape[-1] else 0
+    strided = x.dim() == 2 and x.stride(1) == 1 and x.stride(0) % 8 == 0       # a column slice of a wider output
+    if (mod is not None and x.is_cuda and x.dtype == torch.bfloat16 and w.dtype == torch.bfloat16 and (strided or x.is_contiguous())
+            and w.is_contiguous() and mod.bf16_skinny_supported(rows, w.shape[0], x.shape[-1])):
+        return mod.bf16_skinny(x if strided else x.view(rows, -1), w).view(*x.shape[:-1], w.shape[0])
+    return torch.nn.functional.linear(x, w)
+
+
+def router_logits(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """fp32 x @ w^T for a bf16 `x` [T, K] and fp32 router `w`."""
+    mod = _module()
+    if mod is not None and x.is_cuda and x.dtype == torch.bfloat16 and x.is_contiguous() and mod.router_logits_supported(x.shape[0], x.shape[1]):
+        return mod.router_logits(x, w)
+    return torch.nn.functional.linear(x.float(), w)
+
+
 # ---- MoE experts ------------------------------------------------------------------------
 
 def nvfp4_moe_supported(k: int) -> bool:
@@ -176,9 +197,50 @@ def nvfp4_moe_gemm(x: torch.Tensor, w: torch.Tensor, scale: torch.Tensor, gscale
     return _module().nvfp4_moe_gemm(x, w, scale, gscale, active_experts, offsets, tokens, int(num_rows))
 
 
+def moe_route_supported(tokens: int, top_k: int, num_experts: int) -> bool:
+    mod = _module()
+    return mod is not None and mod.moe_route_supported(int(tokens), int(top_k), int(num_experts))
+
+
+def moe_route(logits: torch.Tensor, bias: torch.Tensor, top_k: int, scaling: float, norm: bool, offset: int, local_experts: int):
+    """Router logits fp32 [T, E] -> (weights fp32 [T, k], active, offsets, tokens, inv) int32: this
+    rank's (token, slot) pairs sorted by expert as `nvfp4_moe_gemm` takes them; inv[t * k + s] is the
+    pair's sorted row, -1 for an expert of another rank."""
+    return _module().moe_route(logits, bias, int(top_k), float(scaling), bool(norm), int(offset), int(local_experts))
+
+
+def moe_swiglu(gate_up: torch.Tensor, limit: Optional[float]) -> torch.Tensor:
+    """bf16 [rows, 2I] (gate | up) -> [rows, I]: silu(min(gate, limit)) * clamp(up, +-limit)."""
+    return _module().moe_swiglu(gate_up, float("inf") if limit is None else float(limit))
+
+
+def moe_combine(down: torch.Tensor, inv: torch.Tensor, weights: torch.Tensor, shared: Optional[torch.Tensor]) -> torch.Tensor:
+    """out[t] = sum_s weights[t, s] * down[inv[t, s]] (+ shared[t]); bf16 [T, H]."""
+    return _module().moe_combine(down, inv, weights, shared)
+
+
+# ---- mHC hyper-connections (GLM-5.3-Flash) ------------------------------------------------
+
+def hc_fused_supported(hc_mult: int, hidden_size: int) -> bool:
+    mod = _module()
+    return mod is not None and mod.hc_fused_supported(int(hc_mult), int(hidden_size))
+
+
+def hc_collapse(streams: torch.Tensor, fn: torch.Tensor, base: torch.Tensor, scale: torch.Tensor, norm_w: torch.Tensor,
+                iters: int, hc_eps: float, rms_eps: float, norm_eps: float):
+    """streams bf16 [T, 4, H] -> (post fp32 [T, 4], comb fp32 [T, 4, 4], collapsed bf16 [T, H],
+    RMSNorm(collapsed) bf16 [T, H] with weight `norm_w`, epsilon `norm_eps`)."""
+    return _module().hc_collapse(streams, fn, base, scale, norm_w, int(iters), float(hc_eps), float(rms_eps), float(norm_eps))
+
+
+def hc_expand(block_out: torch.Tensor, post: torch.Tensor, comb: torch.Tensor, streams: torch.Tensor) -> torch.Tensor:
+    """-> bf16 [T, 4, H]: post[:, :, None] * block_out[:, None, :] + comb^T @ streams."""
+    return _module().hc_expand(block_out.contiguous(), post, comb, streams)
+
+
 # ---- MLA decode + DSA selection (GLM-5.3-Flash) -------------------------------------------
 
-MLA_DECODE_CHUNK = 256
+MLA_DECODE_CHUNK = 32     # one warp walks a chunk serially: short enough that short contexts spread over SMs
 
 
 def mla_decode_supported(latent_dim: int) -> bool:

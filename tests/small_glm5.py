@@ -31,12 +31,12 @@ MLA = dict(num_attention_heads=2, num_key_value_heads=2, q_lora_rank=32, kv_lora
            qk_rope_head_dim=0, v_head_dim=32, index_n_heads=2, index_head_dim=32, index_topk=8, index_kpool=4)
 
 
-def text_config():
+def text_config(moe_i: int = MOE_I):
     from transformers.models.glm5_next.configuration_glm5_next import Glm5NextTextConfig
 
     cfg = Glm5NextTextConfig(
         vocab_size=VOCAB, hidden_size=HIDDEN, num_hidden_layers=LAYERS, intermediate_size=DENSE_I,
-        moe_intermediate_size=MOE_I, n_routed_experts=EXPERTS, num_experts_per_tok=TOPK, n_shared_experts=1,
+        moe_intermediate_size=moe_i, n_routed_experts=EXPERTS, num_experts_per_tok=TOPK, n_shared_experts=1,
         routed_scaling_factor=2.5, norm_topk_prob=True, swiglu_limit=10.0, rms_norm_eps=1e-5,
         linear_num_heads=KDA_H, linear_head_dim=KDA_D, linear_conv_kernel_dim=4, linear_lower_bound=-5.0,
         hc_mult=4, hc_sinkhorn_iters=20, hc_eps=1e-6, layer_types=list(LAYER_TYPES), mlp_layer_types=list(MLP_TYPES),
@@ -50,11 +50,12 @@ class SmallGlm5:
     """`index_topk` 8 (default) makes the sparse selection kick in after 8 tokens; a larger value
     keeps every test sequence in the dense regime (CUDA-graph decode, verify graphs)."""
 
-    def __init__(self, path: str = "/tmp/opencode/small-glm5", seed: int = 5, index_topk: int = 8):
+    def __init__(self, path: str = "/tmp/opencode/small-glm5", seed: int = 5, index_topk: int = 8, moe_i: int = MOE_I):
         from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextModel
 
         self.path = Path(path)
-        self.cfg = text_config()
+        self.moe_i = moe_i           # expert slices need moe_i / tp to stay a multiple of 128
+        self.cfg = text_config(moe_i)
         self.cfg.index_topk = index_topk
         self.seed = seed
         torch.manual_seed(seed)
@@ -156,8 +157,8 @@ class SmallGlm5:
                         out[L + f"mlp.shared_experts.{name}.weight"] = getattr(mlp.shared_experts, name).weight.data.clone()
                     for e in range(EXPERTS):
                         gu = mlp.experts.gate_up_proj[e]
-                        mlp.experts.gate_up_proj[e, :MOE_I] = quant(L + f"mlp.experts.{e}.gate_proj", gu[:MOE_I])
-                        mlp.experts.gate_up_proj[e, MOE_I:] = quant(L + f"mlp.experts.{e}.up_proj", gu[MOE_I:])
+                        mlp.experts.gate_up_proj[e, :self.moe_i] = quant(L + f"mlp.experts.{e}.gate_proj", gu[:self.moe_i])
+                        mlp.experts.gate_up_proj[e, self.moe_i:] = quant(L + f"mlp.experts.{e}.up_proj", gu[self.moe_i:])
                         mlp.experts.down_proj[e] = quant(L + f"mlp.experts.{e}.down_proj", mlp.experts.down_proj[e])
                 else:
                     for name in ("gate_proj", "up_proj", "down_proj"):
@@ -208,7 +209,7 @@ class SmallGlm5:
         out[ix + "weights_proj.weight"] = rnd(IH, H); out[ix + "index_kpool_compress_ape"] = rnd(KP, IHD, std=0.3)
         out[ix + "index_kpool_compress_gate"] = rnd(IHD, H, std=0.1)
         out[L + "mlp.gate.weight"] = rnd(EXPERTS, H); out[L + "mlp.gate.e_score_correction_bias"] = (torch.randn(EXPERTS, generator=gen) * 0.3)
-        for n, shape in (("gate_proj", (MOE_I, H)), ("up_proj", (MOE_I, H)), ("down_proj", (H, MOE_I))):
+        for n, shape in (("gate_proj", (self.moe_i, H)), ("up_proj", (self.moe_i, H)), ("down_proj", (H, self.moe_i))):
             out[L + f"mlp.shared_experts.{n}.weight"] = rnd(*shape)
             for e in range(EXPERTS):
                 quant(L + f"mlp.experts.{e}.{n}", rnd(*shape))

@@ -60,6 +60,16 @@ class HyperConnection(nn.Module):
         self.fn = nn.Parameter(torch.empty(width, hc_mult * hidden_size, dtype=torch.bfloat16), requires_grad=False)
         self.base = nn.Parameter(torch.empty(width, dtype=torch.bfloat16), requires_grad=False)
         self.scale = nn.Parameter(torch.empty(3, dtype=torch.bfloat16), requires_grad=False)
+        self.fused = cuda_ops.hc_fused_supported(hc_mult, hidden_size)
+
+    def collapse_norm(self, streams: torch.Tensor, norm: RMSNorm) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """`collapse` then `norm` of the collapsed row: (post, comb, normed)."""
+        if self.fused and streams.is_cuda:
+            post, comb, _, normed = cuda_ops.hc_collapse(streams, self.fn.data, self.base.data, self.scale.data, norm.weight.data,
+                                                         self.iters, self.eps, self.rms_eps, norm.variance_epsilon)
+            return post, comb, normed
+        post, comb, collapsed = self.collapse(streams)
+        return post, comb, norm(collapsed)
 
     def collapse(self, streams: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         T = streams.shape[0]
@@ -82,6 +92,8 @@ class HyperConnection(nn.Module):
 
     @staticmethod
     def expand(block_out: torch.Tensor, post: torch.Tensor, comb: torch.Tensor, streams: torch.Tensor) -> torch.Tensor:
+        if streams.is_cuda and cuda_ops.hc_fused_supported(streams.shape[1], streams.shape[2]):
+            return cuda_ops.hc_expand(block_out, post, comb, streams)
         dtype = streams.dtype
         return post.to(dtype).unsqueeze(-1) * block_out.unsqueeze(1) + torch.matmul(comb.to(dtype).transpose(-1, -2), streams)
 
@@ -108,6 +120,8 @@ class ClampedMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gu, _ = self.gate_up_proj(x)
+        if gu.is_cuda and cuda_ops.available() and self.intermediate_size % 8 == 0:
+            return self.down_proj(cuda_ops.moe_swiglu(gu, self.limit))[0]
         gate, up = gu[..., :self.intermediate_size], gu[..., self.intermediate_size:]
         if self.limit is not None:
             gate = gate.clamp(max=self.limit)
@@ -153,9 +167,9 @@ class KimiDeltaAttention(nn.Module):
 
     def forward(self, x: torch.Tensor, forward_batch: ForwardBatch, pool) -> torch.Tensor:
         proj = self.qkv_proj(x)
-        gate = self.g_b_proj(self.g_a_proj(x))
-        beta = self.b_proj(x)
-        fgate = self.f_b_proj(self.f_a_proj(x))
+        f_a, g_a, beta = cuda_ops.bf16_linear(x, self.small_proj).split([self.head_dim, self.head_dim, self.num_heads], dim=-1)
+        gate = self.g_b_proj(g_a)
+        fgate = self.f_b_proj(f_a)
         starts, lens, slots, fresh = forward_batch.linear_attention_meta()
         idx = self.state_layer_idx
         conv_snap = rec_snap = None
@@ -170,6 +184,10 @@ class KimiDeltaAttention(nn.Module):
             starts, lens, slots, fresh, pool.conv_states[idx], pool.conv_states[idx],
             pool.recurrent_states[idx], pool.recurrent_states[idx], conv_snap, rec_snap)
         return self.o_proj(o)[0]
+
+    def merge_small_projections(self) -> None:
+        """f_a, g_a and b read the same `x` and are too narrow to fill the GPU alone: one GEMM instead."""
+        self.small_proj = torch.cat([self.f_a_proj.weight.data, self.g_a_proj.weight.data, self.b_proj.weight.data]).contiguous()
 
     @property
     def _lower_bound(self) -> float:
@@ -560,15 +578,14 @@ class Glm5FlashDecoderLayer(nn.Module):
 
     def forward(self, streams: torch.Tensor, forward_batch: ForwardBatch, pool: MLATokenToKVPool, shared):
         """`shared`: the last indexed MLA layer's selection, for layers that reuse it (see MLAAttention)."""
-        post, comb, h = self.attn_hc.collapse(streams)
-        h = self.input_layernorm(h)
+        post, comb, h = self.attn_hc.collapse_norm(streams, self.input_layernorm)
         if self.is_linear:
             h = self.self_attn(h, forward_batch, pool.mamba_pool)
         else:
             h, shared = self.self_attn(h, forward_batch, pool.latent[self.layer_id], pool.index.get(self.layer_id), shared)
         streams = HyperConnection.expand(h, post, comb, streams)
-        post, comb, h = self.ffn_hc.collapse(streams)
-        h = self.mlp(self.post_attention_layernorm(h))
+        post, comb, h = self.ffn_hc.collapse_norm(streams, self.post_attention_layernorm)
+        h = self.mlp(h)
         return HyperConnection.expand(h, post, comb, streams), shared
 
 
@@ -588,8 +605,14 @@ class Glm5FlashModel(nn.Module):
         streams = h.unsqueeze(1).expand(-1, self.dims.hc_mult, -1).contiguous()
         pool = forward_batch.token_to_kv_pool
         shared = None
-        for layer in self.layers:
+        aux_layers = forward_batch.capture_aux_layers
+        aux: List[torch.Tensor] = []
+        for i, layer in enumerate(self.layers):
             streams, shared = layer(streams, forward_batch, pool, shared)
+            if aux_layers is not None and i in aux_layers:
+                aux.append(streams.mean(dim=1))      # the drafter's context: streams contracted like the head
+        if aux_layers is not None:
+            forward_batch.aux_hidden_states = torch.cat(aux, dim=-1)
         # Glm5NextTextHyperHead: unweighted mean of the streams, then the final norm.
         return self.norm(streams.mean(dim=1))
 
@@ -658,8 +681,8 @@ class Glm5FlashForCausalLM(LlamaForCausalLMBase):
 
     Tensor parallelism (`tp_plan`): attention heads are sharded (KDA q/k/v/convs/gates/o_proj
     and the per-rank state pool; MLA q_b/kv_b/o_proj), the low-rank projections, norms and
-    the DSA indexer are replicated, dense and shared MLPs are column/row sharded, the MoE is
-    expert-parallel (each rank owns E/tp experts), embeddings and lm_head vocab-sharded.
+    the DSA indexer are replicated, dense and shared MLPs and every routed expert are column/row
+    sharded (see NVFP4MoE), embeddings and lm_head vocab-sharded.
 
     Decode: KDA and MoE kernels plus the absorbed MLA decode kernel, all with static launch
     shapes, so decode batches run as CUDA graphs while every request is within `index_topk`
@@ -715,10 +738,10 @@ class Glm5FlashForCausalLM(LlamaForCausalLMBase):
             per = total // tp
             return (1, per * r, per * (r + 1))
 
-        m = _EXPERT_ANY_RE.match(n)
-        if m:
-            per = g.num_experts // tp
-            return None if per * r <= int(m.group(2)) < per * (r + 1) else SKIP
+        if _EXPERT_ANY_RE.match(n):                           # every rank holds a slice of every expert
+            if n.endswith((".weight_scale_2", ".input_scale")):
+                return None
+            return cols(shape[1]) if ".down_proj." in n else rows(shape[0])
         if n.endswith("embed_tokens.weight") or n.startswith("lm_head."):
             per = ceil_div(shape[0], tp)                      # VocabParallelEmbedding's partition
             return (0, per * r, min(per * (r + 1), shape[0]))
@@ -765,10 +788,9 @@ class Glm5FlashForCausalLM(LlamaForCausalLMBase):
         loaded: Set[str] = set()
         unexpected: Set[str] = set()
         n_layers = self.dims.num_layers
-        tp, rank = get_tp_info()
+        tp, _ = get_tp_info()
         qkv = self.dims.kda_heads // tp * self.dims.kda_head_dim          # this rank's heads
         seg = {"q": 0, "k": qkv, "v": 2 * qkv}
-        expert_offset = rank * (self.dims.num_experts // tp)
         for name, w in weights:
             if name.endswith(".input_scale"):       # W4A4 activation scales: lily runs W4A16
                 continue
@@ -793,7 +815,7 @@ class Glm5FlashForCausalLM(LlamaForCausalLMBase):
                 name = name[:-len("weight")] + "weight_packed"
             m = _EXPERT_RE.match(name)
             if m:
-                owner, e, proj, kind = m.group(1), int(m.group(2)) - expert_offset, m.group(3), m.group(4)
+                owner, e, proj, kind = m.group(1), int(m.group(2)), m.group(3), m.group(4)
                 moe = self.mtp.mlp if owner == "mtp" else self.model.layers[int(owner.rsplit(".", 1)[1])].mlp
                 moe.experts.load_expert(e, proj, kind, w)
                 tag = "down" if proj == "down" else "gate_up"
@@ -832,4 +854,7 @@ class Glm5FlashForCausalLM(LlamaForCausalLMBase):
                 raise RuntimeError(f"failed loading {name!r} shape={tuple(w.shape)} dtype={w.dtype} into "
                                    f"param shape={tuple(param.shape)} shard={shard_id!r}: {e}") from e
             loaded.add(name)
+        for module in self.modules():
+            if isinstance(module, KimiDeltaAttention):
+                module.merge_small_projections()
         return loaded, unexpected

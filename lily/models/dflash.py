@@ -250,16 +250,14 @@ class CandidateSelector(nn.Module):
         B, S, _ = hidden.shape
         unary, candidates = torch.topk(logits, self.top_k, dim=-1, sorted=False)   # [B, S, K]
         proj = self.hidden_projection(hidden).float()                               # [B, S, r]
-        pred_cb = self.predecessor_codebook.float()
-        succ_cb = self.successor_codebook.float()
-        temps = torch.tensor([float(t) for t in temperatures], device=hidden.device)
         sampling_rows = [i for i, t in enumerate(temperatures) if t > 0]
+        temps = torch.tensor([float(t) for t in temperatures], device=hidden.device) if sampling_rows else None
         predecessor = anchor_ids
         path, qs = [], []
         for pos in range(S):
             cand = candidates[:, pos]                                                # [B, K]
-            gate = F.embedding(predecessor, pred_cb) * proj[:, pos]                 # [B, r]
-            pair = torch.einsum("br,bkr->bk", gate, F.embedding(cand, succ_cb))
+            gate = F.embedding(predecessor, self.predecessor_codebook).float() * proj[:, pos]   # [B, r]
+            pair = torch.einsum("br,bkr->bk", gate, F.embedding(cand, self.successor_codebook).float())
             scores = unary[:, pos] + pair                                            # [B, K]
             if sampling_rows:
                 q = torch.softmax(scores / temps.clamp_min(1e-5).unsqueeze(1), dim=-1)
