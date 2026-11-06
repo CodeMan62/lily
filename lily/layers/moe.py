@@ -23,6 +23,7 @@ from torch import nn
 
 from lily.distributed import get_tp_info, tensor_model_parallel_all_reduce
 from lily.layers.quantization import cuda_ops
+from lily.utils import run_beside
 from lily.layers.quantization.base import NVFP4_GROUP_SIZE, nvfp4_dequantize
 
 
@@ -149,17 +150,21 @@ class NVFP4MoE(nn.Module):
     def _forward_small_batch(self, x: torch.Tensor) -> torch.Tensor:
         """Decode and verify batches: same maths as `forward` through the fused routing kernels."""
         g, ex = self.gate, self.experts
-        logits = cuda_ops.router_logits(x, g.weight)
-        weights, active, offsets, tokens, inv = cuda_ops.moe_route(
-            logits, g.e_score_correction_bias, self.top_k, g.routed_scaling_factor, g.norm_topk_prob, 0, self.num_experts)
-        R = x.shape[0] * self.top_k
-        active = active[:R]                 # at most one expert per row: the GEMM's grid needs no more
-        gate_up = cuda_ops.nvfp4_moe_gemm(x, ex.gate_up_packed, ex.gate_up_scale.view(torch.uint8), ex.gate_up_gscale,
-                                          active, offsets, tokens, R)
-        act = cuda_ops.moe_swiglu(gate_up, self.swiglu_limit)
-        down = cuda_ops.nvfp4_moe_gemm(act, ex.down_packed, ex.down_scale.view(torch.uint8), ex.down_gscale,
-                                       active, offsets, self._rows(R, x.device), R)
-        shared = self.shared_experts(x) if self.shared_experts is not None else None
+
+        def routed():
+            logits = F.linear(x.float(), g.weight)
+            weights, active, offsets, tokens, inv = cuda_ops.moe_route(
+                logits, g.e_score_correction_bias, self.top_k, g.routed_scaling_factor, g.norm_topk_prob, 0, self.num_experts)
+            R = x.shape[0] * self.top_k
+            active = active[:R]             # at most one expert per row: the GEMM's grid needs no more
+            gate_up = cuda_ops.nvfp4_moe_gemm(x, ex.gate_up_packed, ex.gate_up_scale.view(torch.uint8), ex.gate_up_gscale,
+                                              active, offsets, tokens, R)
+            act = cuda_ops.moe_swiglu(gate_up, self.swiglu_limit)
+            return cuda_ops.nvfp4_moe_gemm(act, ex.down_packed, ex.down_scale.view(torch.uint8), ex.down_gscale,
+                                           active, offsets, self._rows(R, x.device), R), inv, weights
+
+        # the shared expert hides routing, whose kernels leave most of the GPU idle
+        shared, (down, inv, weights) = run_beside(lambda: self.shared_experts(x) if self.shared_experts is not None else None, routed)
         return tensor_model_parallel_all_reduce(cuda_ops.moe_combine(down, inv, weights, shared))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

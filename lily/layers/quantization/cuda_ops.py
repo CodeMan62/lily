@@ -174,14 +174,6 @@ def bf16_linear(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     return torch.nn.functional.linear(x, w)
 
 
-def router_logits(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-    """fp32 x @ w^T for a bf16 `x` [T, K] and fp32 router `w`."""
-    mod = _module()
-    if mod is not None and x.is_cuda and x.dtype == torch.bfloat16 and x.is_contiguous() and mod.router_logits_supported(x.shape[0], x.shape[1]):
-        return mod.router_logits(x, w)
-    return torch.nn.functional.linear(x.float(), w)
-
-
 # ---- MoE experts ------------------------------------------------------------------------
 
 def nvfp4_moe_supported(k: int) -> bool:

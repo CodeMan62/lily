@@ -75,58 +75,7 @@ bf16_skinny_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __r
     }
 }
 
-// Router logits, fp32 like the reference: one block per expert, the fp32 row is streamed once for all
-// M rows of bf16 activations.
-constexpr int ROUTER_THREADS = 256;
-constexpr int ROUTER_K = ROUTER_THREADS * 4;
-
-__global__ void __launch_bounds__(ROUTER_THREADS)
-router_logits_kernel(const __nv_bfloat16* __restrict__ x, const float* __restrict__ w, float* __restrict__ out, int M, int N, int K) {
-    __shared__ float red[ROUTER_THREADS / 32][MAX_M];
-    const float* wr = w + (size_t)blockIdx.x * K;
-    float acc[MAX_M];
-#pragma unroll
-    for (int m = 0; m < MAX_M; ++m) acc[m] = 0.f;
-#pragma unroll 4
-    for (int k = threadIdx.x * 4; k < K; k += ROUTER_K) {
-        const float4 v = *reinterpret_cast<const float4*>(wr + k);
-#pragma unroll
-        for (int m = 0; m < MAX_M; ++m) {
-            if (m >= M) break;
-            const __nv_bfloat162* xp = reinterpret_cast<const __nv_bfloat162*>(x + (size_t)m * K + k);
-            const float2 a = __bfloat1622float2(xp[0]), b = __bfloat1622float2(xp[1]);
-            acc[m] += a.x * v.x + a.y * v.y + b.x * v.z + b.y * v.w;
-        }
-    }
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-#pragma unroll
-    for (int m = 0; m < MAX_M; ++m) {
-        float s = acc[m];
-        for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
-        if (lane == 0) red[warp][m] = s;
-    }
-    __syncthreads();
-    if (threadIdx.x < M) {
-        float s = 0.f;
-#pragma unroll
-        for (int i = 0; i < ROUTER_THREADS / 32; ++i) s += red[i][threadIdx.x];
-        out[(size_t)threadIdx.x * N + blockIdx.x] = s;
-    }
-}
-
 }  // namespace
-
-bool router_logits_supported(int64_t M, int64_t K) { return M >= 1 && M <= MAX_M && K % ROUTER_K == 0; }
-
-torch::Tensor router_logits(torch::Tensor x, torch::Tensor w) {
-    TORCH_CHECK(x.is_contiguous() && w.is_contiguous() && x.scalar_type() == at::kBFloat16 && w.scalar_type() == at::kFloat);
-    const at::cuda::CUDAGuard guard(x.device());
-    const int M = (int)x.size(0), K = (int)x.size(1), N = (int)w.size(0);
-    auto out = torch::empty({M, N}, x.options().dtype(at::kFloat));
-    router_logits_kernel<<<N, ROUTER_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), w.data_ptr<float>(), out.data_ptr<float>(), M, N, K);
-    return out;
-}
 
 bool bf16_skinny_supported(int64_t M, int64_t N, int64_t K) { return M >= 1 && M <= MAX_M && N >= 256 && K % K_PIECE == 0; }
 

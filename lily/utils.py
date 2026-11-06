@@ -73,3 +73,22 @@ def int_tensor(values: Sequence[int], device, dtype: torch.dtype = torch.int64) 
         return torch.tensor(values, dtype=dtype, device=device)
     out = _pinned_ring().put(values, device)
     return out if dtype == torch.int64 else out.to(dtype)
+
+
+@functools.cache
+def _side_stream() -> torch.cuda.Stream:
+    return torch.cuda.Stream()
+
+
+def run_beside(side_fn, main_fn):
+    """(side_fn(), main_fn()), concurrently while capturing a CUDA graph: small kernels leave most of
+    the GPU idle. Sequential otherwise, where the allocator would need the tensors' streams recorded."""
+    if not torch.cuda.is_current_stream_capturing():
+        return side_fn(), main_fn()
+    main, side = torch.cuda.current_stream(), _side_stream()
+    side.wait_stream(main)
+    with torch.cuda.stream(side):
+        a = side_fn()
+    b = main_fn()
+    main.wait_stream(side)
+    return a, b

@@ -29,6 +29,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from lily.distributed.distributed import get_tp_info, tensor_model_parallel_all_reduce
 from lily.layers.layernorm import RMSNorm
 from lily.layers.linear import ReplicatedLinear
 from lily.layers.rotary import get_rope
@@ -200,7 +201,7 @@ class DFlashMLP(nn.Module):
         self.down_proj = ReplicatedLinear(cfg.intermediate_size, cfg.hidden_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        return tensor_model_parallel_all_reduce(self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x)))
 
 
 class DFlashLayer(nn.Module):
@@ -346,6 +347,10 @@ class DFlash2Drafter(nn.Module):
         missing = [m for m in missing if not m.endswith("rotary.cos_sin_cache")]
         if missing or unexpected:
             raise RuntimeError(f"DFlash2 checkpoint mismatch: missing {missing[:5]}, unexpected {unexpected[:5]}")
+        tp_size, tp_rank = get_tp_info()
+        for layer in model.layers:      # the MLP is most of the drafter's weights: each rank reads a slice
+            for proj, dim in ((layer.mlp.gate_proj, 0), (layer.mlp.up_proj, 0), (layer.mlp.down_proj, 1)):
+                proj.weight.data = proj.weight.data.chunk(tp_size, dim)[tp_rank].contiguous()
         return model.to(device).eval()
 
 

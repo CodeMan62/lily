@@ -57,13 +57,9 @@ torch::Tensor moe_combine(torch::Tensor down, torch::Tensor inv, torch::Tensor w
 
 bool bf16_skinny_supported(int64_t M, int64_t N, int64_t K);
 torch::Tensor bf16_skinny(torch::Tensor x, torch::Tensor w);
-bool router_logits_supported(int64_t M, int64_t K);
-torch::Tensor router_logits(torch::Tensor x, torch::Tensor w);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("bf16_skinny_supported", &bf16_skinny_supported);
-    m.def("router_logits_supported", &router_logits_supported);
-    m.def("router_logits", &router_logits, "fp32 router logits for M <= 8 bf16 rows");
     m.def("bf16_skinny", &bf16_skinny, "bf16 linear for M <= 8 rows, weight streaming on tensor cores");
     m.def("moe_route_supported", &moe_route_supported);
     m.def("moe_route", &moe_route, "Router top-k and the sorted CSR of (token, slot) pairs for a small batch");
