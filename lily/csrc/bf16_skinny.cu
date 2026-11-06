@@ -46,7 +46,9 @@ __global__ void __launch_bounds__(THREADS)
 bf16_skinny_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ out,
                    int M, int N, int K, int ldx) {
     __shared__ float red[WARPS][ROWS][MAX_M];
+    #if __CUDA_ARCH__ >= 900
     asm volatile("griddepcontrol.launch_dependents;");
+    #endif
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int n0 = blockIdx.x * ROWS;
     const int ra = min(n0 + g, N - 1), rb = min(n0 + g + 8, N - 1);
@@ -64,7 +66,9 @@ bf16_skinny_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __r
             b[u] = load_stream(wb + k);
         }
         // weights do not depend on the previous kernel, the activations do
+        #if __CUDA_ARCH__ >= 900
         if (k0 == warp * K_PIECE) asm volatile("griddepcontrol.wait;" ::: "memory");
+        #endif
 #pragma unroll
         for (int u = 0; u < UNROLL; ++u) {
             const int k = k0 + 32 * u + 8 * t;
@@ -117,7 +121,7 @@ torch::Tensor bf16_skinny(torch::Tensor x, torch::Tensor w) {
     attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attr.val.programmaticStreamSerializationAllowed = 1;
     config.attrs = &attr;      // start streaming weights while the previous kernel finishes
-    config.numAttrs = 1;
+    config.numAttrs = at::cuda::getCurrentDeviceProperties()->major >= 9 ? 1 : 0;   // PDL is sm_90+
     C10_CUDA_CHECK(cudaLaunchKernelEx(&config, bf16_skinny_kernel, reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
                                       reinterpret_cast<const __nv_bfloat16*>(w.data_ptr()),
                                       reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), M, N, K, (int)x.stride(0)));

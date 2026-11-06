@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import threading
 import time
@@ -10,6 +11,7 @@ from typing import Dict, Iterable, List, Optional
 
 import torch
 import zmq
+from torch.profiler import record_function
 
 from lily.scheduler.io_struct import (
     AbortReq,
@@ -25,7 +27,8 @@ from lily.model_executor.forward_batch_info import ForwardBatch
 from lily.model_executor.model_runner import ModelRunner
 from lily.sampling.sampling_params import SamplingParams
 from lily.distributed import broadcast_pyobj, tensor_model_parallel_broadcast
-from lily.utils import new_generator
+from lily.profiler import DecodeProfiler
+from lily.utils import int_tensor, new_generator
 
 logger = logging.getLogger(__name__)
 
@@ -186,6 +189,7 @@ class Scheduler:
         self._requests: Dict[str, _RequestItem] = {}
         self.prefill_tokens_computed = 0
         self.decode_steps = 0
+        self._profiler = DecodeProfiler.from_env(tp_rank)
 
         # ---- overlap scheduling (Phase 7) ---------------------------------
         self.enable_overlap = (
@@ -448,6 +452,8 @@ class Scheduler:
         if batch.forward_mode.is_decode():
             if not self.spec_on:
                 self.decode_steps += len(batch.reqs)
+            if self._profiler is not None:
+                self._profiler.step(len(batch.reqs))
         else:
             self.prefill_tokens_computed += batch.extend_num_tokens - batch.num_decode_reqs
         return self.worker.forward_batch_generation(batch.get_model_worker_batch())
@@ -586,26 +592,38 @@ class Scheduler:
 
     def _process_spec_result(self, batch, result, running: List[Req]) -> None:
         """Commit each request's accepted run (stopping at EOS / max tokens), advance its
-        cached length by the inputs it consumed, and free the unused verify slots."""
+        cached length by the inputs it consumed, and free the unused verify slots. Host work
+        per round, not per token or request: one output message per request, one free."""
         n = result.spec_slots
+        per_token = result.sampler_output is not None          # logprobs ride on the plain sampler (k = 0)
+        unused: List[int] = []                                  # offsets into the round's verify slots
         for i, req in enumerate(batch.reqs):
-            committed = 0
+            committed: List[int] = []
             for tok in result.accepted[i]:
-                self._append_token(req, tok, [], result, i)   # emits, checks stop conditions
-                committed += 1
+                if per_token:
+                    self._append_token(req, tok, [], result, i)   # emits, checks stop conditions
+                else:
+                    req.output_ids.append(tok)
+                    req.check_finished()
+                committed.append(tok)
                 if req.finished:
                     break
-            # Inputs now cached: the previous tail token plus committed-1 accepted
-            # drafts, i.e. `committed` of the n verify slots; the rest go back.
+            if not per_token:
+                self._emit_many(req, committed)
+                if req.finished:
+                    self._finish(req)
+            # Inputs now cached: the previous tail token plus len(committed)-1 accepted
+            # drafts, i.e. len(committed) of the n verify slots; the rest go back.
             start = req.seq_len
-            if committed < n:
-                unused = self.req_to_token[req.req_pool_idx, start + committed:start + n]
-                self.token_to_kv_pool_allocator.free(unused.long().clone())
-            req.seq_len = start + committed
+            if len(committed) < n:
+                unused.extend(range(i * n + len(committed), (i + 1) * n))
+            req.seq_len = start + len(committed)
             if req.finished:
                 self.cache_finished_req(req)
             else:
                 running.append(req)
+        if unused:
+            self.token_to_kv_pool_allocator.free(batch.out_cache_loc[int_tensor(unused, batch.out_cache_loc.device)])
         self.decode_steps += len(batch.reqs)
 
     def _append_token(self, req: Req, token: int, running: List[Req], result=None, index: int = 0) -> None:
@@ -657,6 +675,11 @@ class Scheduler:
         )
         self._publish(req, out)
 
+    def _emit_many(self, req: Req, tokens: List[int]) -> None:
+        """A round's committed tokens of one request in one message (the detokenizer takes chunks)."""
+        if tokens:
+            self._publish(req, self._output(req, new_token_ids=list(tokens)))
+
     def _finish(self, req: Req) -> None:
         out = self._output(
             req,
@@ -673,11 +696,14 @@ class Scheduler:
     def step(self) -> bool:
         """Run one scheduler step. Returns False when there is nothing to do."""
         self._overlap_loop = False
-        batch = self.get_next_batch_to_run()
+        with record_function("lily.schedule"):
+            batch = self.get_next_batch_to_run()
         if batch is None or not batch.reqs:
             return False
-        result = self.run_batch(batch)
-        self.process_batch_result(batch, result)
+        with record_function("lily.forward"):
+            result = self.run_batch(batch)
+        with record_function("lily.commit"):
+            self.process_batch_result(batch, result)
         return True
 
     def overlap_step(self, prev):
@@ -731,7 +757,8 @@ def _receive_messages(tp_rank: int, poller, recv) -> List:
                 msgs.append(recv.recv_pyobj(zmq.NOBLOCK))
             except zmq.Again:
                 break
-    return broadcast_pyobj(msgs, tp_rank, src=0)
+    with record_function("lily.broadcast_requests"):
+        return broadcast_pyobj(msgs, tp_rank, src=0)
 
 
 def run_scheduler_process(
@@ -794,6 +821,7 @@ def run_scheduler_process(
                 except Exception:
                     break
             if outs and tp_rank == 0:
+              with record_function("lily.outputs"):
                 send.send_pyobj(BatchTokenIDOut(
                     rids=[o.rid for o in outs],
                     output_ids=[o.new_token_ids for o in outs],

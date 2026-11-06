@@ -86,6 +86,14 @@ mla_decode_kernel(const __nv_bfloat16* __restrict__ q_lat,        // [B, H, D]
     const int n = vis_idx ? vis_cnt[b] : (int)seq_lens[b];
     const int t0 = ck * chunk, t1 = min(t0 + chunk, n);
     const int chunks = gridDim.x;
+    if (t0 >= n) {                       // past the row's end: an empty partial, which the combine skips
+        if (lane == 0) {
+            const size_t base = ((size_t)b * chunks + ck) * H + h;
+            part_m[base] = -FLT_MAX;
+            part_l[base] = 0.f;
+        }
+        return;
+    }
 
     float q[PER], acc[PER];
     load_row<PER>(q_lat + ((size_t)b * H + h) * D, lane, q);
@@ -121,6 +129,40 @@ mla_decode_kernel(const __nv_bfloat16* __restrict__ q_lat,        // [B, H, D]
     float* o = part_o + base * D + lane * PER;
 #pragma unroll
     for (int j = 0; j < PER; ++j) o[j] = acc[j];
+}
+
+// Combine of the per-chunk partials: one warp per (b, h), only the row's ceil(n / chunk) chunks are read.
+template <int D>
+__global__ void __launch_bounds__(THREADS)
+mla_combine_kernel(const float* __restrict__ part_m, const float* __restrict__ part_l, const float* __restrict__ part_o,
+                   const int64_t* __restrict__ seq_lens, const int32_t* __restrict__ vis_cnt, int chunk, int chunks,
+                   int B, int H, __nv_bfloat16* __restrict__ out) {
+    constexpr int PER = D / 32;
+    const int idx = blockIdx.x * WARPS + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (idx >= B * H) return;
+    const int b = idx / H, h = idx % H;
+    const int n = vis_cnt ? vis_cnt[b] : (int)seq_lens[b];
+    const int nc = min(chunks, (n + chunk - 1) / chunk);
+    float M = -FLT_MAX, L = 0.f, acc[PER];
+#pragma unroll
+    for (int j = 0; j < PER; ++j) acc[j] = 0.f;
+    for (int c = 0; c < nc; ++c) {
+        const size_t base = ((size_t)b * chunks + c) * H + h;
+        const float l_c = part_l[base];
+        if (l_c == 0.f) continue;
+        const float m_c = part_m[base];
+        const float M_new = fmaxf(M, m_c);
+        const float corr = __expf(M - M_new), w = __expf(m_c - M_new);
+        L = L * corr + w * l_c;
+        const float* o = part_o + base * D + lane * PER;
+#pragma unroll
+        for (int j = 0; j < PER; ++j) acc[j] = acc[j] * corr + w * o[j];
+        M = M_new;
+    }
+    const float inv = L > 0.f ? 1.f / L : 0.f;
+    __nv_bfloat16* dst = out + ((size_t)b * H + h) * D + lane * PER;
+#pragma unroll
+    for (int j = 0; j < PER; ++j) dst[j] = __float2bfloat16(acc[j] * inv);
 }
 
 // ---- DSA k-pool scores -----------------------------------------------------------------------
@@ -240,6 +282,38 @@ std::vector<torch::Tensor> mla_decode_partials(torch::Tensor q_lat, torch::Tenso
     }
 #undef LAUNCH
     return {part_m, part_l, part_o};
+}
+
+torch::Tensor mla_decode_combine(torch::Tensor part_m, torch::Tensor part_l, torch::Tensor part_o, torch::Tensor seq_lens,
+                                 c10::optional<torch::Tensor> vis_cnt, int64_t chunk) {
+    TORCH_CHECK(part_o.dim() == 4 && part_o.is_contiguous() && part_o.scalar_type() == torch::kFloat32, "mla_combine: part_o [B, chunks, H, D] fp32");
+    const int64_t B = part_o.size(0), chunks = part_o.size(1), H = part_o.size(2), D = part_o.size(3);
+    TORCH_CHECK(part_m.is_contiguous() && part_l.is_contiguous() && part_m.numel() == B * chunks * H && part_l.numel() == part_m.numel());
+    TORCH_CHECK(seq_lens.scalar_type() == torch::kInt64 && seq_lens.is_contiguous() && mla_decode_supported(D));
+    const int32_t* vc = nullptr;
+    if (vis_cnt.has_value()) {
+        TORCH_CHECK(vis_cnt->scalar_type() == torch::kInt32 && vis_cnt->is_contiguous() && vis_cnt->numel() == B);
+        vc = vis_cnt->data_ptr<int32_t>();
+    }
+    const c10::cuda::CUDAGuard guard(part_o.device());
+    auto out = torch::empty({B, H, D}, part_o.options().dtype(torch::kBFloat16));
+    if (B * H == 0) return out;
+    const int blocks = (int)((B * H + WARPS - 1) / WARPS);
+    auto stream = at::cuda::getCurrentCUDAStream();
+#define LAUNCH_C(DD)                                                                                                 \
+    mla_combine_kernel<DD><<<blocks, THREADS, 0, stream>>>(part_m.data_ptr<float>(), part_l.data_ptr<float>(),       \
+        part_o.data_ptr<float>(), seq_lens.data_ptr<int64_t>(), vc, (int)chunk, (int)chunks, (int)B, (int)H,         \
+        reinterpret_cast<__nv_bfloat16*>(out.data_ptr()))
+    switch (D) {
+        case 32: LAUNCH_C(32); break;
+        case 64: LAUNCH_C(64); break;
+        case 128: LAUNCH_C(128); break;
+        case 256: LAUNCH_C(256); break;
+        default: LAUNCH_C(512); break;
+    }
+#undef LAUNCH_C
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
 }
 
 bool dsa_pool_scores_supported(int64_t head_dim, int64_t kpool) {

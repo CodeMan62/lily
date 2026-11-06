@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
 import torch
+from torch.profiler import record_function
 
 from lily.distributed import tensor_model_parallel_broadcast
 from lily.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -242,7 +243,8 @@ class SpecWorkerBase:
 
         # ---- 1. draft ----
         if k > 0:
-            dtoks, dprobs = self.draft(reqs, k, m, slots, req_idx, sampling)
+            with record_function("lily.spec.draft"):
+                dtoks, dprobs = self.draft(reqs, k, m, slots, req_idx, sampling)
         else:
             dtoks = torch.zeros(B, 0, dtype=torch.int64, device=dev)
             dprobs = None
@@ -252,24 +254,24 @@ class SpecWorkerBase:
         verify_ids = torch.cat([tail.unsqueeze(1), dtoks], dim=1).reshape(-1)
         hybrid = bool(self.gdn_layers) and k > 0
         self.verified_in_graph = self.verify_graphs is not None and self.verify_graphs.can_run(B, k, m)
-        if self.verified_in_graph:
-            logits, hidden, aux, stash = self.verify_graphs.replay(verify_ids, req_idx, m, worker_batch.out_cache_loc)
-            logits = logits.view(B, k + 1, -1)
-            table_fn = (lambda: self.verify_graphs.replay_table(B, self.gdn_layers, self.pool)) if hybrid else None
-        else:
-            fb_v = self._extend_batch(
-                verify_ids, req_idx, m, [k + 1] * B, worker_batch.out_cache_loc,
-                return_all_logits=True, capture_hidden_states=True, capture_aux_layers=self.aux_layers,
-                gdn_snapshot=hybrid, gdn_proj_stash=[None] * len(self.gdn_layers) if hybrid else None)
-            out = self.runner.forward(fb_v)
-            logits = out.next_token_logits.view(B, k + 1, -1)
-            hidden = out.hidden_states                                   # [B*(k+1), H]
-            aux = out.aux_hidden_states
-            stash = fb_v.gdn_proj_stash
-            table_fn = (lambda: torch.tensor(
-                [layer.replay_table_row(stash[layer.linear_layer_idx], self.pool) for layer in self.gdn_layers],
-                dtype=torch.int64).to(dev, non_blocking=True)) if hybrid else None
-
+        with record_function("lily.spec.verify" + ("" if self.verified_in_graph else ".eager")):
+            if self.verified_in_graph:
+                logits, hidden, aux, stash = self.verify_graphs.replay(verify_ids, req_idx, m, worker_batch.out_cache_loc)
+                logits = logits.view(B, k + 1, -1)
+                table_fn = (lambda: self.verify_graphs.replay_table(B, self.gdn_layers, self.pool)) if hybrid else None
+            else:
+                fb_v = self._extend_batch(
+                    verify_ids, req_idx, m, [k + 1] * B, worker_batch.out_cache_loc,
+                    return_all_logits=True, capture_hidden_states=True, capture_aux_layers=self.aux_layers,
+                    gdn_snapshot=hybrid, gdn_proj_stash=[None] * len(self.gdn_layers) if hybrid else None)
+                out = self.runner.forward(fb_v)
+                logits = out.next_token_logits.view(B, k + 1, -1)
+                hidden = out.hidden_states                                   # [B*(k+1), H]
+                aux = out.aux_hidden_states
+                stash = fb_v.gdn_proj_stash
+                table_fn = (lambda: torch.tensor(
+                    [layer.replay_table_row(stash[layer.linear_layer_idx], self.pool) for layer in self.gdn_layers],
+                    dtype=torch.int64).to(dev, non_blocking=True)) if hybrid else None
 
         # ---- 3. accept ----
         sampler_output = None
@@ -325,9 +327,9 @@ class SpecWorkerBase:
             lens = int_tensor([j + 1 for j in num_acc_cpu], dev, torch.int32)
             self.gdn_layers[0].replay(table, stash[0], starts, lens, req_idx.contiguous(), self.pool)
 
-
         # ---- 5. drafter state from the accepted rows ----
-        self.after_accept(reqs, accepted, num_acc_cpu, hidden, aux, slots, m, k, sampling)
+        with record_function("lily.spec.after_accept"):
+            self.after_accept(reqs, accepted, num_acc_cpu, hidden, aux, slots, m, k, sampling)
 
         self.rounds += 1
         self.request_rounds += B

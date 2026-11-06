@@ -75,7 +75,7 @@ class DFlashSpecWorker(SpecWorkerBase):
 
     def draft_pass(self, anchor: torch.Tensor, m_dev: torch.Tensor, req_idx: torch.Tensor, L: int, k: int):
         """The drafter over a whole block [anchor, mask, ...] with `L` context rows: (hidden [B, k, H]
-        of the first k mask rows, their logits [B, k, V]); verifying fewer drafts than the block holds
+        of the first k mask rows, their top-k logits as (values, ids)); verifying fewer drafts than the block holds
         only drops the least likely ones. Device tensors and fixed shapes: the draft graphs capture it."""
         B = anchor.shape[0]
         dev = self.device
@@ -93,7 +93,7 @@ class DFlashSpecWorker(SpecWorkerBase):
                   for i in range(self.drafter.cfg.num_hidden_layers)]                        # [B, L, kvh, hd]
         hidden = self.drafter(block_ids, positions, self.embed, ctx_kv, ctx_pos)            # [B, S, H]
         rows_h = hidden[:, 1:k + 1]                                                         # mask rows
-        return rows_h, self.drafter.logits(rows_h, self.model.lm_head)                      # [B, k, V] fp32
+        return rows_h, self.drafter.topk_logits(rows_h, self.model.lm_head, self.drafter.candidate_selector.top_k)
 
     def can_prefetch(self, batch_size: int) -> bool:
         return self.draft_graphs is not None and self.draft_graphs.can_run(batch_size) and "_select" not in self.__dict__
@@ -120,7 +120,7 @@ class DFlashSpecWorker(SpecWorkerBase):
         rows_h, logits = self.draft_pass(anchor, m_dev, req_idx, L, k)
         temps = [0.0 if r.sampling_params.greedy else r.sampling_params.temperature for r in reqs]
         path, cands, q = self._select(rows_h, logits, anchor, temps, [r.generator for r in reqs])
-        dprobs = torch.zeros(len(reqs), k, logits.shape[-1], device=dev)
+        dprobs = torch.zeros(len(reqs), k, self.model.lm_head.num_embeddings, device=dev)
         dprobs.scatter_add_(2, cands, q)
         return path, dprobs
 

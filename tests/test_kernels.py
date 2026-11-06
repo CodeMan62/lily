@@ -68,3 +68,23 @@ def test_mla_decode_matches_torch(D, H, sparse):
         c = latent[pool.req_to_token[b + 1, visible[b]].long()].float()
         want = torch.softmax(q_lat[b].float() @ c.t() * D ** -0.5, dim=-1) @ c
         torch.testing.assert_close(got[b].float(), want, atol=2e-2, rtol=2e-2)
+
+
+# ---- small_fused.cu: bit-exact against the torch formulations ------------------------------------------
+
+def test_small_fused_matches_torch():
+    from lily.layers.rotary import RotaryEmbedding
+
+    gen = torch.Generator().manual_seed(3)
+    x = (torch.randn(37, 512, generator=gen) * 3).bfloat16().cuda()
+    w = (torch.rand(512, generator=gen) + 0.5).bfloat16().cuda()
+    want = w * (x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + 1e-5)).bfloat16()
+    assert torch.equal(cuda_ops.rmsnorm(x, w, 1e-5), want)
+    rope = RotaryEmbedding(128, 128, 4096, 10000.0, dtype=torch.bfloat16).cuda()
+    pos = torch.randint(0, 4096, (24,), generator=gen).cuda()
+    q, k = (torch.randn(24, h * 128, generator=gen).bfloat16().cuda() for h in (8, 2))
+    got = rope(pos, q, k)
+    cos, sin = (t.repeat(1, 2).unsqueeze(1) for t in rope.cos_sin_cache[pos].chunk(2, dim=-1))
+    rot = lambda t: torch.cat((-t[..., 64:], t[..., :64]), dim=-1)  # noqa: E731
+    for g, t in zip(got, (q.view(24, 8, 128), k.view(24, 2, 128))):
+        assert torch.equal(g, (t * cos + rot(t) * sin).view(24, -1))

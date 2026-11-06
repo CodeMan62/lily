@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import gc
 
+from typing import Optional
+
 import torch
 
 
@@ -20,19 +22,20 @@ ROUTING_TIE = 0.01  # MoE corrected-score margin below which a routing flip is b
 
 
 def _routing_margin_hooks(model, margins: list):
-    """Hook every MoE router so each forward appends the smallest top-k margin over the
-    layers (the last position's) to `margins`; returns the handles."""
-    from lily.layers.moe import TopkRouter
+    """Hook every MoE block so each forward appends the smallest top-k margin over the layers (the
+    last position's) to `margins`; returns the handles. Hooks the block's input, not the router
+    module, so the fused router kernel path is covered too."""
+    from lily.layers.moe import NVFP4MoE
 
     per_forward: list = []
 
-    def hook(mod, inp, out):
-        x = inp[0]
-        scores = torch.sigmoid(torch.nn.functional.linear(x.float(), mod.weight)) + mod.e_score_correction_bias
-        top = scores.topk(mod.top_k + 1, dim=-1).values
+    def hook(mod, inp):
+        x, gate = inp[0], mod.gate
+        scores = torch.sigmoid(torch.nn.functional.linear(x.float(), gate.weight)) + gate.e_score_correction_bias
+        top = scores.topk(gate.top_k + 1, dim=-1).values
         per_forward.append((top[-1, -2] - top[-1, -1]).item())
 
-    handles = [m.register_forward_hook(hook) for m in model.modules() if isinstance(m, TopkRouter)]
+    handles = [m.register_forward_pre_hook(hook) for m in model.modules() if isinstance(m, NVFP4MoE)]
 
     def flush():
         if per_forward:
@@ -111,15 +114,16 @@ def assert_matches_up_to_tie_flip(got, ref, second, gaps, min_agree: int = 3, ti
 
 # ---- tensor parallelism on one GPU ------------------------------------------------------------
 
-def _tp_rank(path: str, tp: int, rank: int, port: int, ids, steps: int, out):
+def _tp_rank(path: str, tp: int, rank: int, port: int, ids, steps: int, out, extra: Optional[dict] = None):
     import os
 
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     from lily.engine import Engine, EngineConfig
 
+    args = {"dist_backend": "gloo", "disable_cuda_graph": True} if tp > 1 else {}
+    args.update(extra or {})
     eng = Engine(EngineConfig(path, dtype="bfloat16", max_total_tokens=256, max_running_requests=1, tp_size=tp, rank=rank,
-                              dist_init_addr=f"127.0.0.1:{port}", device="cuda:0",
-                              server_args={"dist_backend": "gloo", "disable_cuda_graph": True} if tp > 1 else None))
+                              dist_init_addr=f"127.0.0.1:{port}", device="cuda:0", server_args=args or None))
     try:
         logits = eng.all_prefill_logits(ids).float().cpu()
         toks = eng.generate_greedy(ids, steps, ignore_eos=True)
@@ -131,9 +135,10 @@ def _tp_rank(path: str, tp: int, rank: int, port: int, ids, steps: int, out):
     return logits, toks
 
 
-def assert_tp2_matches_tp1(path: str, ids, steps: int, strict: torch.Tensor, atol: float) -> None:
+def assert_tp2_matches_tp1(path: str, ids, steps: int, strict: torch.Tensor, atol: float, extra: Optional[dict] = None) -> None:
     """Two ranks over gloo on this GPU (per-rank weight slicing + collectives) reproduce the single-rank
-    prefill logits (at the `strict` positions, within `atol`) and the greedy tokens up to near-ties."""
+    prefill logits (at the `strict` positions, within `atol`) and the greedy tokens up to near-ties.
+    `extra`: more server args for the two ranks (e.g. a speculative drafter: its sharded top-k)."""
     import multiprocessing as mp
     import queue
     import socket
@@ -146,7 +151,7 @@ def assert_tp2_matches_tp1(path: str, ids, steps: int, strict: torch.Tensor, ato
         port = s.getsockname()[1]
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
-    procs = [ctx.Process(target=_tp_rank, args=(path, 2, r, port, ids, steps, q), daemon=True) for r in range(2)]
+    procs = [ctx.Process(target=_tp_rank, args=(path, 2, r, port, ids, steps, q, extra), daemon=True) for r in range(2)]
     for p in procs:
         p.start()
     results, deadline = {}, time.time() + 900

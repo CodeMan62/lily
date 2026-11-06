@@ -31,6 +31,7 @@ from torch import nn
 
 from lily.distributed.distributed import get_tp_info, tensor_model_parallel_all_reduce
 from lily.layers.layernorm import RMSNorm
+from lily.layers.quantization import cuda_ops
 from lily.layers.linear import ReplicatedLinear
 from lily.layers.rotary import get_rope
 
@@ -110,10 +111,16 @@ class GroupedDynamicCausalConv(nn.Module):
         self.base_kernel = nn.Parameter(torch.empty(2, kernel_size, hidden_size, dtype=torch.bfloat16), requires_grad=False)
         self.kernel_projection = ReplicatedLinear(hidden_size, 2 * kernel_size * groups)
 
-    def _convolve(self, hidden: torch.Tensor, dynamic: torch.Tensor, base: torch.Tensor) -> torch.Tensor:
-        # hidden [B, L, H]; dynamic [B, L, K, groups]; base [K, H]
+    def _convolve(self, hidden: torch.Tensor, projected: torch.Tensor, which: int) -> torch.Tensor:
+        # hidden [B, L, H]; projected [B, L, 2 * K * groups] (the kernel projection); base [K, H]
         B, L, H = hidden.shape
         groups = H // self.group_size
+        if self.kernel_size == 2:
+            out = cuda_ops.dyn_conv2(hidden, projected, which * 2 * groups, self.base_kernel[which], self.group_size)
+            if out is not None:
+                return out
+        dynamic = projected.view(B, L, 2, self.kernel_size, groups)[:, :, which]
+        base = self.base_kernel[which]
         blocks = hidden.view(B, L, groups, self.group_size)
         out = torch.zeros_like(blocks)
         for offset in range(self.kernel_size):
@@ -124,12 +131,11 @@ class GroupedDynamicCausalConv(nn.Module):
         return out.view(B, L, H)
 
     def prepare(self, hidden: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        groups = hidden.shape[-1] // self.group_size
-        dynamic = self.kernel_projection(hidden).view(*hidden.shape[:-1], 2, self.kernel_size, groups)
-        return self._convolve(hidden, dynamic[..., 0, :, :], self.base_kernel[0]), dynamic[..., 1, :, :]
+        projected = self.kernel_projection(hidden)
+        return self._convolve(hidden, projected, 0), projected
 
-    def finish(self, hidden: torch.Tensor, dynamic: torch.Tensor) -> torch.Tensor:
-        return self._convolve(hidden, dynamic, self.base_kernel[1])
+    def finish(self, hidden: torch.Tensor, projected: torch.Tensor) -> torch.Tensor:
+        return self._convolve(hidden, projected, 1)
 
 
 class DFlashAttention(nn.Module):
@@ -173,10 +179,6 @@ class DFlashAttention(nn.Module):
         k_blk = k_blk.view(B, S, self.num_kv_heads, self.head_dim)
         k = torch.cat([ctx_k, k_blk], dim=1)          # [B, L+S, kvh, hd]
         v = torch.cat([ctx_v, v_blk], dim=1)
-        rep = self.num_heads // self.num_kv_heads
-        if rep > 1:
-            k = k.repeat_interleave(rep, dim=2)
-            v = v.repeat_interleave(rep, dim=2)
         # mask [B, 1, S, L+S]: context within the window, block fully visible (non-causal)
         qpos = positions.unsqueeze(2)                                   # [B, S, 1]
         kpos = torch.cat([ctx_pos, positions], dim=1).unsqueeze(1)     # [B, 1, L+S]
@@ -189,7 +191,7 @@ class DFlashAttention(nn.Module):
                 visible = visible & (kpos - qpos < self.sliding_window)
         out = F.scaled_dot_product_attention(
             q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
-            attn_mask=visible.unsqueeze(1), scale=self.scaling)
+            attn_mask=visible.unsqueeze(1), scale=self.scaling, enable_gqa=self.num_heads != self.num_kv_heads)
         return self.o_proj(out.transpose(1, 2).reshape(B, S, -1))
 
 
@@ -249,9 +251,16 @@ class CandidateSelector(nn.Module):
         (one-hot for temperature 0). q is the draft distribution for rejection sampling.
         """
         B, S, _ = hidden.shape
-        unary, candidates = torch.topk(logits, self.top_k, dim=-1, sorted=False)   # [B, S, K]
+        if isinstance(logits, tuple):                                               # (values, ids) from `topk_logits`
+            unary, candidates = logits
+        else:
+            unary, candidates = torch.topk(logits, self.top_k, dim=-1, sorted=False)   # [B, S, K]
         proj = self.hidden_projection(hidden).float()                               # [B, S, r]
         sampling_rows = [i for i, t in enumerate(temperatures) if t > 0]
+        if not sampling_rows:
+            fused = cuda_ops.select_greedy(unary, candidates, proj, anchor_ids, self.predecessor_codebook, self.successor_codebook)
+            if fused is not None:
+                return fused[0], candidates, fused[1]
         temps = torch.tensor([float(t) for t in temperatures], device=hidden.device) if sampling_rows else None
         predecessor = anchor_ids
         path, qs = [], []
@@ -319,14 +328,22 @@ class DFlash2Drafter(nn.Module):
             h = layer(h, positions, ck, cv, ctx_pos)
         return self.norm(h)
 
-    def logits(self, hidden: torch.Tensor, lm_head) -> torch.Tensor:
-        logits = lm_head.compute_logits(hidden.reshape(-1, hidden.shape[-1])).view(*hidden.shape[:-1], -1)
+    def _finish_logits(self, logits: torch.Tensor) -> torch.Tensor:
         if self.cfg.output_multiplier != 1.0:
             logits = logits * self.cfg.output_multiplier
         cap = self.cfg.final_logit_softcapping
         if cap:
             logits = torch.tanh(logits / float(cap)) * float(cap)
         return logits
+
+    def logits(self, hidden: torch.Tensor, lm_head) -> torch.Tensor:
+        return self._finish_logits(lm_head.compute_logits(hidden.reshape(-1, hidden.shape[-1])).view(*hidden.shape[:-1], -1))
+
+    def topk_logits(self, hidden: torch.Tensor, lm_head, k: int):
+        """(values [.., k] fp32, token ids [.., k]) of the top-k logits, without gathering the full vocab under TP
+        (the multiplier and softcap are monotonic, so the top-k is taken first)."""
+        values, ids = lm_head.compute_topk(hidden.reshape(-1, hidden.shape[-1]), k)
+        return self._finish_logits(values).view(*hidden.shape[:-1], -1), ids.view(*hidden.shape[:-1], -1)
 
     # ---- loading ---------------------------------------------------------------
 

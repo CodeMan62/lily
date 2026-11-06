@@ -5,6 +5,8 @@ from typing import Optional, Tuple, Union
 import torch
 from torch import nn
 
+from lily.layers.quantization import cuda_ops
+
 
 class RMSNorm(nn.Module):
     """RMSNorm with optional fused residual add (SGLang/vLLM convention).
@@ -28,6 +30,10 @@ class RMSNorm(nn.Module):
         if residual is not None:
             x = x + residual
             residual = x
+        elif not self.zero_centered and x.dtype == torch.bfloat16:
+            out = cuda_ops.rmsnorm(x, self.weight, self.variance_epsilon)        # one kernel instead of ~8
+            if out is not None:
+                return out
         orig_dtype = x.dtype
         xf = x.to(torch.float32)
         variance = xf.pow(2).mean(dim=-1, keepdim=True)

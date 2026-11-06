@@ -124,7 +124,7 @@ class NVFP4MoE(nn.Module):
     and the shared expert, itself row-parallel, is folded into the same all-reduce (build it with
     `reduce_results=False`)."""
 
-    SMALL_BATCH = 64     # tokens the fused routing path takes; the route kernel is one block
+    SMALL_BATCH = 128    # tokens the fused routing path takes (16 requests x 8 verify rows); the route kernel is one block
 
     def __init__(self, hidden_size: int, intermediate_size: int, num_experts: int, top_k: int,
                  routed_scaling_factor: float, norm_topk_prob: bool, swiglu_limit: Optional[float],

@@ -271,12 +271,11 @@ class ScheduleBatch:
         self._ensure_req_slots()
         n = num_draft + 1
         out_loc = self._alloc_tokens(n * len(self.reqs))
-        seq_lens: List[int] = []
-        for i, req in enumerate(self.reqs):
-            prefix = req.seq_len
-            values = out_loc[i * n:(i + 1) * n].to(torch.int32)
-            self.req_to_token_pool.write((req.req_pool_idx, slice(prefix, prefix + n)), values)
-            seq_lens.append(prefix + n)
+        seq_lens = [req.seq_len + n for req in self.reqs]
+        # every request's n slots in one write (two index tensors), not two kernels per request
+        rows = int_tensor([req.req_pool_idx for req in self.reqs for _ in range(n)], self.device)
+        cols = int_tensor([req.seq_len + j for req in self.reqs for j in range(n)], self.device)
+        self.req_to_token_pool.write((rows, cols), out_loc.to(torch.int32))
         self.forward_mode = ForwardMode.DECODE
         self.spec_num_draft = num_draft
         self.input_ids = int_tensor([r.output_ids[-1] for r in self.reqs], self.device)

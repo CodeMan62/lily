@@ -26,7 +26,8 @@ logger = logging.getLogger(__name__)
 
 _CSRC = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "csrc")
 _SOURCES = [os.path.join(_CSRC, f) for f in ("bindings.cpp", "nvfp4_gemv.cu", "nvfp4_gemm_tc.cu", "nvfp4_moe.cu", "gdn_fused.cu",
-                                                "kda_fused.cu", "mla_decode.cu", "hc_fused.cu", "moe_fused.cu", "bf16_skinny.cu")]
+                                                "kda_fused.cu", "mla_decode.cu", "hc_fused.cu", "moe_fused.cu", "bf16_skinny.cu",
+                                                "small_fused.cu")]
 
 # Row-count routing for NVFP4 linears: the CUDA-core GEMV streams weights at HBM
 # bandwidth up to 4 rows; 5..16 rows go to the tensor-core GEMM (one dequant per
@@ -168,6 +169,39 @@ def l2_prefetch(w: torch.Tensor) -> None:
     _module().l2_prefetch(w, 32)
 
 
+def _bf16_cuda(*tensors) -> bool:
+    return _module() is not None and all(t.is_cuda and t.dtype == torch.bfloat16 for t in tensors)
+
+
+def rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float) -> Optional[torch.Tensor]:
+    """w * bf16(x * rsqrt(mean(x^2) + eps)) over the last dim; None when unavailable."""
+    if not _bf16_cuda(x, w) or x.shape[-1] % 8:
+        return None
+    return _module().rmsnorm_fused(x.reshape(-1, x.shape[-1]).contiguous(), w, float(eps)).view(x.shape)
+
+
+def dyn_conv2(x: torch.Tensor, dyn: torch.Tensor, dyn_off: int, base: torch.Tensor, group: int) -> Optional[torch.Tensor]:
+    """DFlash two-tap conv: x [B, L, H], dyn [B, L, D] with the taps' per-group kernels at columns dyn_off.., base [2, H]."""
+    if not _bf16_cuda(x, dyn) or x.shape[-1] % 8 or group % 8:
+        return None
+    return _module().dyn_conv2(x.contiguous(), dyn, int(dyn_off), base.contiguous(), int(group))
+
+
+def rope_neox(q: torch.Tensor, k: torch.Tensor, cos_sin: torch.Tensor, positions: torch.Tensor):
+    """Rotate q [N, Hq, D] and k [N, Hk, D] over the whole head -> (q, k) copies; None when unavailable."""
+    if not _bf16_cuda(q, k, cos_sin) or positions.dtype != torch.int64 or q.shape[-1] % 2:
+        return None
+    return _module().rope_neox(q.contiguous(), k.contiguous(), cos_sin, positions.contiguous())
+
+
+def select_greedy(unary, cand, proj, anchor, pred_cb, succ_cb):
+    """DFlash greedy candidate path -> (path [B, S] int64, one-hot q [B, S, K] fp32); None when unavailable."""
+    mod = _module()
+    if mod is None or not unary.is_cuda or not mod.select_greedy_supported(unary.shape[-1], proj.shape[-1]):
+        return None
+    return mod.select_greedy(unary.contiguous(), cand.contiguous(), proj.contiguous(), anchor.contiguous(), pred_cb, succ_cb)
+
+
 def bf16_linear(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     """x @ w^T: the weight-streaming kernel for small batches, cuBLAS otherwise."""
     mod = _module()
@@ -252,14 +286,12 @@ def mla_decode(q_lat: torch.Tensor, latent: torch.Tensor, req_to_token: torch.Te
     0..seq_len-1; sparse: the `vis_cnt[b]` positions in `vis_idx[b]`). q_lat bf16 [B, H, D]
     (queries already absorbed into latent space); returns the softmax-weighted latent sum
     bf16 [B, H, D]. `chunks` fixes the launch shape (ceil(max visible / chunk)): static for graphs."""
-    m, l, o = _module().mla_decode_partials(q_lat, latent, req_to_token, req_pool_indices, seq_lens, vis_idx, vis_cnt,
-                                            float(scale), int(chunk), int(chunks))
-    # combine the per-chunk online-softmax partials: [B, chunks, H] / [B, chunks, H, D]
-    m_max = m.amax(dim=1, keepdim=True)
-    w = torch.exp(m - m_max)
-    denom = (w * l).sum(dim=1)                                       # [B, H]
-    out = (w.unsqueeze(-1) * o).sum(dim=1) / denom.unsqueeze(-1)
-    return out.to(q_lat.dtype)
+    mod = _module()
+    m, l, o = mod.mla_decode_partials(q_lat, latent, req_to_token, req_pool_indices, seq_lens, vis_idx, vis_cnt,
+                                      float(scale), int(chunk), int(chunks))
+    # combine the per-chunk online-softmax partials [B, chunks, H] / [B, chunks, H, D]: one kernel that reads
+    # only each row's ceil(n / chunk) chunks (the launch shape is static for graphs, the context usually short)
+    return mod.mla_decode_combine(m, l, o, seq_lens, vis_cnt, int(chunk))
 
 
 def dsa_pool_scores_supported(head_dim: int, kpool: int) -> bool:

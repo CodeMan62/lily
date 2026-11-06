@@ -12,6 +12,8 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 from torch import nn
 
+from lily.layers.quantization import cuda_ops
+
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
     x1, x2 = x.chunk(2, dim=-1)
@@ -61,6 +63,10 @@ class RotaryEmbedding(nn.Module):
         n = positions.shape[0]
         query = query.view(n, -1, self.head_size)
         key = key.view(n, -1, self.head_size)
+        if self.is_neox_style and self.rotary_dim == self.head_size:
+            fused = cuda_ops.rope_neox(query, key, self.cos_sin_cache, positions)
+            if fused is not None:
+                return fused[0].view(q_shape), fused[1].view(k_shape)
         cos_sin = self.cos_sin_cache[positions]  # [N, rotary_dim]
         cos, sin = cos_sin.chunk(2, dim=-1)
         if self.is_neox_style:

@@ -42,8 +42,9 @@ def references(tiny):
     return [greedy_reference(str(tiny.path), p, NEW) for p in PROMPTS]
 
 
-def _scheduler(path, spec, k=3, algo="MTP", max_reqs=4):
-    draft = SmallQwen35(build=False).build_dflash() if (spec and algo == "DFLASH") else None
+def _scheduler(path, spec, k=3, algo="MTP", max_reqs=4, draft=None):
+    if spec and algo == "DFLASH" and draft is None:
+        draft = SmallQwen35(build=False).build_dflash()
     sa = ServerArgs(model_path=path, dtype="bfloat16", attention_backend="triton", context_length=512, max_running_requests=max_reqs,
                     max_total_tokens=2048, disable_radix_cache=True, speculative_algorithm=algo if spec else None,
                     speculative_num_steps=k if spec else None, speculative_draft_model_path=draft)
@@ -152,11 +153,11 @@ def test_speculative_decoding_matches_plain(tiny, references, algo):
         real_draft = worker.draft
 
         def oracle(hidden, logits, anchor, temps, gens):
-            B, S, _ = logits.shape
+            B, S, _ = hidden.shape
             path = torch.tensor([[ref[len(r.output_ids) + i] if len(r.output_ids) + i < len(ref) else 0 for i in range(S)]
-                                 for r in worker._oracle_reqs], dtype=torch.int64, device=logits.device)
+                                 for r in worker._oracle_reqs], dtype=torch.int64, device=hidden.device)
             cands = path.unsqueeze(2).expand(B, S, worker.drafter.cfg.selector_top_k).contiguous()
-            q = torch.zeros(B, S, worker.drafter.cfg.selector_top_k, device=logits.device)
+            q = torch.zeros(B, S, worker.drafter.cfg.selector_top_k, device=hidden.device)
             q[..., 0] = 1.0
             return path, cands, q
 
@@ -194,3 +195,10 @@ def test_speculative_sampling_reproducible_and_penalties_fall_back(tiny):
 
 def test_tp2_matches_tp1(tiny):
     assert_tp2_matches_tp1(str(tiny.path), IDS[:20], 6, torch.ones(20, dtype=torch.bool), atol=0.05)
+
+
+def test_tp2_matches_tp1_dflash(tiny):
+    """The drafter under TP: sharded lm_head top-k for the candidates, sharded drafter MLP."""
+    draft = SmallQwen35(build=False).build_dflash()
+    assert_tp2_matches_tp1(str(tiny.path), IDS[:20], 8, torch.ones(20, dtype=torch.bool), atol=0.05,
+                           extra={"speculative_algorithm": "DFLASH", "speculative_draft_model_path": draft, "speculative_num_steps": 3})
