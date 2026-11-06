@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import threading
 import time
@@ -25,7 +26,7 @@ from lily.model_executor.forward_batch_info import ForwardBatch
 from lily.model_executor.model_runner import ModelRunner
 from lily.sampling.sampling_params import SamplingParams
 from lily.distributed import broadcast_pyobj, tensor_model_parallel_broadcast
-from lily.utils import new_generator
+from lily.utils import int_tensor, new_generator
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +130,82 @@ class TpModelWorker:
         return GenerationBatchResult(None, None, res.sampler_output, accepted=res.accepted, spec_slots=res.num_draft + 1)
 
 
+class DecodeProfiler:
+    """`LILY_PROFILE_BS=1,8` (+ `LILY_PROFILE_STEPS`, default 20): rank 0 profiles that many consecutive decode
+    steps the first time a batch of each listed size runs, and logs the kernels sorted by GPU time. Kernels
+    inside CUDA-graph replays are reported individually; NCCL kernel time includes the wait for the other ranks."""
+
+    def __init__(self, sizes: List[int], steps: int):
+        self.pending = set(sizes)
+        self.steps = steps
+        self.cpu = bool(os.environ.get("LILY_PROFILE_CPU"))
+        self.prof = None
+        self.bs = 0
+        self.n = 0
+
+    @classmethod
+    def from_env(cls, tp_rank: int) -> Optional["DecodeProfiler"]:
+        spec = os.environ.get("LILY_PROFILE_BS", "")
+        if not spec or tp_rank != 0:
+            return None
+        return cls([int(x) for x in spec.split(",")], int(os.environ.get("LILY_PROFILE_STEPS", "20")))
+
+    def step(self, bs: int) -> None:
+        if self.prof is None:
+            if bs not in self.pending:
+                return
+            self.pending.discard(bs)
+            self.bs, self.n = bs, 0
+            torch.cuda.synchronize()
+            if self.cpu:                    # LILY_PROFILE_CPU=1: the host side (cProfile over whole scheduler iterations)
+                import cProfile
+
+                self.prof = cProfile.Profile()
+                self.prof.enable()
+                self.t0 = time.perf_counter()
+                return
+            from torch.profiler import ProfilerActivity, profile
+
+            self.prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
+            self.prof.__enter__()
+            return
+        self.n += 1
+        if bs != self.bs or self.n >= self.steps:
+            torch.cuda.synchronize()
+            if self.cpu:
+                import io
+                import pstats
+
+                self.prof.disable()
+                wall = (time.perf_counter() - self.t0) / self.n * 1000
+                out = io.StringIO()
+                pstats.Stats(self.prof, stream=out).sort_stats("tottime").print_stats(45)
+                logger.info("host profile of %d scheduler iterations at batch size %d (%.2f ms wall per iteration):\n%s",
+                            self.n, self.bs, wall, out.getvalue())
+            else:
+                self.prof.__exit__(None, None, None)
+                logger.info("profile of %d decode steps at batch size %d (GPU time per step, 'nccl' = collectives incl. waits):\n%s",
+                            self.n, self.bs, self.gpu_table())
+            self.prof = None
+
+    def gpu_table(self, rows: int = 40) -> str:
+        items = []
+        for ev in self.prof.key_averages():
+            t = getattr(ev, "self_device_time_total", None)
+            if t is None:
+                t = ev.self_cuda_time_total
+            if t > 0 and ev.device_type.name != "CPU":
+                items.append((t / self.n / 1000.0, ev.count / self.n, ev.key))
+        items.sort(reverse=True)
+        total = sum(t for t, _, _ in items)
+        graphs = sum(ev.count for ev in self.prof.key_averages() if ev.key == "cudaGraphLaunch") / self.n
+        lines = [f"{'ms/step':>8} {'%':>5} {'calls':>6}  kernel",
+                 f"{total:8.3f} {100:5.1f} {'':>6}  total GPU time per step ({graphs:.1f} CUDA-graph launches per step)"]
+        for t, n, name in items[:rows]:
+            lines.append(f"{t:8.3f} {100 * t / total:5.1f} {n:6.1f}  {name[:90]}")
+        return "\n".join(lines)
+
+
 @dataclass
 class SchedulerOutput:
     rid: str
@@ -186,6 +263,7 @@ class Scheduler:
         self._requests: Dict[str, _RequestItem] = {}
         self.prefill_tokens_computed = 0
         self.decode_steps = 0
+        self._profiler = DecodeProfiler.from_env(tp_rank)
 
         # ---- overlap scheduling (Phase 7) ---------------------------------
         self.enable_overlap = (
@@ -448,6 +526,8 @@ class Scheduler:
         if batch.forward_mode.is_decode():
             if not self.spec_on:
                 self.decode_steps += len(batch.reqs)
+            if self._profiler is not None:
+                self._profiler.step(len(batch.reqs))
         else:
             self.prefill_tokens_computed += batch.extend_num_tokens - batch.num_decode_reqs
         return self.worker.forward_batch_generation(batch.get_model_worker_batch())
@@ -586,26 +666,38 @@ class Scheduler:
 
     def _process_spec_result(self, batch, result, running: List[Req]) -> None:
         """Commit each request's accepted run (stopping at EOS / max tokens), advance its
-        cached length by the inputs it consumed, and free the unused verify slots."""
+        cached length by the inputs it consumed, and free the unused verify slots. Host work
+        per round, not per token or request: one output message per request, one free."""
         n = result.spec_slots
+        per_token = result.sampler_output is not None          # logprobs ride on the plain sampler (k = 0)
+        unused: List[int] = []                                  # offsets into the round's verify slots
         for i, req in enumerate(batch.reqs):
-            committed = 0
+            committed: List[int] = []
             for tok in result.accepted[i]:
-                self._append_token(req, tok, [], result, i)   # emits, checks stop conditions
-                committed += 1
+                if per_token:
+                    self._append_token(req, tok, [], result, i)   # emits, checks stop conditions
+                else:
+                    req.output_ids.append(tok)
+                    req.check_finished()
+                committed.append(tok)
                 if req.finished:
                     break
-            # Inputs now cached: the previous tail token plus committed-1 accepted
-            # drafts, i.e. `committed` of the n verify slots; the rest go back.
+            if not per_token:
+                self._emit_many(req, committed)
+                if req.finished:
+                    self._finish(req)
+            # Inputs now cached: the previous tail token plus len(committed)-1 accepted
+            # drafts, i.e. len(committed) of the n verify slots; the rest go back.
             start = req.seq_len
-            if committed < n:
-                unused = self.req_to_token[req.req_pool_idx, start + committed:start + n]
-                self.token_to_kv_pool_allocator.free(unused.long().clone())
-            req.seq_len = start + committed
+            if len(committed) < n:
+                unused.extend(range(i * n + len(committed), (i + 1) * n))
+            req.seq_len = start + len(committed)
             if req.finished:
                 self.cache_finished_req(req)
             else:
                 running.append(req)
+        if unused:
+            self.token_to_kv_pool_allocator.free(batch.out_cache_loc[int_tensor(unused, batch.out_cache_loc.device)])
         self.decode_steps += len(batch.reqs)
 
     def _append_token(self, req: Req, token: int, running: List[Req], result=None, index: int = 0) -> None:
@@ -656,6 +748,11 @@ class Scheduler:
             logprobs=[req.output_logprobs[-1]] if req.output_logprobs else None,
         )
         self._publish(req, out)
+
+    def _emit_many(self, req: Req, tokens: List[int]) -> None:
+        """A round's committed tokens of one request in one message (the detokenizer takes chunks)."""
+        if tokens:
+            self._publish(req, self._output(req, new_token_ids=list(tokens)))
 
     def _finish(self, req: Req) -> None:
         out = self._output(

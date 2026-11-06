@@ -214,6 +214,12 @@ class SmallGlm5:
             for e in range(EXPERTS):
                 quant(L + f"mlp.experts.{e}.{n}", rnd(*shape))
 
+    def build_dflash(self, seed: int = 11) -> str:
+        """Random-weights DFlash2 drafter for this tiny target (block 8, taps layers 1 and 3)."""
+        from tests.util import build_tiny_dflash
+
+        return build_tiny_dflash(self.path.parent / "small-glm5-dflash2", HIDDEN, VOCAB, LAYERS, [1, 3], seed)
+
     # ---- reference -----------------------------------------------------------------------
 
     @torch.inference_mode()

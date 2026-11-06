@@ -39,6 +39,8 @@ std::vector<torch::Tensor> mla_decode_partials(torch::Tensor q_lat, torch::Tenso
                                                torch::Tensor req_pool_indices, torch::Tensor seq_lens,
                                                c10::optional<torch::Tensor> vis_idx, c10::optional<torch::Tensor> vis_cnt,
                                                double scale, int64_t chunk, int64_t chunks);
+torch::Tensor mla_decode_combine(torch::Tensor part_m, torch::Tensor part_l, torch::Tensor part_o, torch::Tensor seq_lens,
+                                 c10::optional<torch::Tensor> vis_cnt, int64_t chunk);
 bool dsa_pool_scores_supported(int64_t head_dim, int64_t kpool);
 torch::Tensor dsa_pool_scores(torch::Tensor index_cache, torch::Tensor ape, torch::Tensor req_to_token,
                               torch::Tensor req_pool_indices, torch::Tensor seq_lens, torch::Tensor q_idx,
@@ -59,9 +61,21 @@ bool bf16_skinny_supported(int64_t M, int64_t N, int64_t K);
 torch::Tensor bf16_skinny(torch::Tensor x, torch::Tensor w);
 void l2_prefetch(torch::Tensor w, int64_t blocks);
 
+torch::Tensor rmsnorm_fused(torch::Tensor x, torch::Tensor w, double eps);
+torch::Tensor dyn_conv2(torch::Tensor x, torch::Tensor dyn, int64_t dyn_off, torch::Tensor base, int64_t group);
+std::vector<torch::Tensor> rope_neox(torch::Tensor q, torch::Tensor k, torch::Tensor cos_sin, torch::Tensor pos);
+bool select_greedy_supported(int64_t K, int64_t R);
+std::vector<torch::Tensor> select_greedy(torch::Tensor unary, torch::Tensor cand, torch::Tensor proj, torch::Tensor anchor,
+                                         torch::Tensor pred_cb, torch::Tensor succ_cb);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("bf16_skinny_supported", &bf16_skinny_supported);
     m.def("l2_prefetch", &l2_prefetch);
+    m.def("rmsnorm_fused", &rmsnorm_fused, "RMSNorm of bf16 rows (fp32 variance, HF rounding)");
+    m.def("dyn_conv2", &dyn_conv2, "DFlash two-tap grouped dynamic causal conv over a block");
+    m.def("rope_neox", &rope_neox, "Neox rotary over whole heads of q and k (bf16 cache)");
+    m.def("select_greedy_supported", &select_greedy_supported);
+    m.def("select_greedy", &select_greedy, "DFlash greedy candidate path through a block");
     m.def("bf16_skinny", &bf16_skinny, "bf16 linear for M <= 8 rows, weight streaming on tensor cores");
     m.def("moe_route_supported", &moe_route_supported);
     m.def("moe_route", &moe_route, "Router top-k and the sorted CSR of (token, slot) pairs for a small batch");
@@ -72,6 +86,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("hc_expand", &hc_expand, "mHC expand: block output into the streams, streams mixed");
     m.def("mla_decode_supported", &mla_decode_supported);
     m.def("mla_decode_partials", &mla_decode_partials, "MLA decode over the latent cache: per-chunk online-softmax partials");
+    m.def("mla_decode_combine", &mla_decode_combine, "Combine the per-chunk MLA partials (only each row's chunks are read)");
     m.def("dsa_pool_scores_supported", &dsa_pool_scores_supported);
     m.def("dsa_pool_scores", &dsa_pool_scores, "DSA indexer k-pool scores for one decode step");
     m.def("nvfp4_moe_supported", &nvfp4_moe_supported);

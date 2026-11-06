@@ -95,5 +95,25 @@ class ParallelLMHead(VocabParallelEmbedding):
         logits = tensor_model_parallel_all_gather(logits, dim=-1)
         return logits[:, : self.num_embeddings].float()
 
+    def compute_topk(self, hidden_states: torch.Tensor, k: int):
+        """Top-k of the full-vocab logits without gathering them: each rank's top-k of its shard, then the
+        top-k of the gathered candidates -> (values float32 [n, k], token ids int64 [n, k])."""
+        if self.quant_method is not None:
+            logits = self.quant_method.apply(self, hidden_states, self.bias)
+        else:
+            logits = F.linear(hidden_states, self.weight, self.bias)
+        logits = logits.float()
+        valid = self.num_embeddings - self.vocab_start            # padded rows of the last shard never win
+        if valid < logits.shape[-1]:
+            logits[:, max(valid, 0):] = float("-inf")
+        values, ids = torch.topk(logits, min(k, logits.shape[-1]), dim=-1, sorted=False)
+        ids = ids + self.vocab_start
+        if self.tp_size > 1:
+            values = tensor_model_parallel_all_gather(values, dim=-1)
+            ids = tensor_model_parallel_all_gather(ids, dim=-1)
+            values, pick = torch.topk(values, k, dim=-1, sorted=False)
+            ids = ids.gather(1, pick)
+        return values, ids
+
     def forward(self, input_ids):  # pragma: no cover
         raise RuntimeError("ParallelLMHead is applied by LogitsProcessor, not called directly")
