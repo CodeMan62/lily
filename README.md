@@ -23,8 +23,6 @@ DFlash2 with k = 7, real prompts, 256-token outputs.
 | 16 | 777 | 18.3 |
 | 32 | 1034 | 27.0 |
 
-What gets there: `docs/techniques-207.md`.
-
 ## Install
 
 ```bash
