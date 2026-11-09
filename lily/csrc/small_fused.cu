@@ -37,31 +37,43 @@ __device__ __forceinline__ float warp_sum(float v) {
 
 // ---- RMSNorm: one warp per row --------------------------------------------------------------------------
 // out = w * bf16(x * rsqrt(mean(x^2) + eps)): the variance in fp32, then the HF rounding order.
+// ZC (zero-centered, Qwen3.5): out = bf16(x * rsqrt(...) * (1 + w)) all in fp32.
+// RES: x = bf16(x + r) first, written to `sum` (the new residual stream).
 constexpr int NORM_WARPS = 8;
 
+template <bool ZC, bool RES>
 __global__ void __launch_bounds__(NORM_WARPS * 32)
-rmsnorm_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ out,
-               int N, int H, float eps) {
+rmsnorm_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ r, const __nv_bfloat16* __restrict__ w,
+               __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ sum, int N, int H, float eps) {
     const int row = blockIdx.x * NORM_WARPS + (threadIdx.x >> 5), lane = threadIdx.x & 31;
     if (row >= N) return;
     const int nv = H / VEC;
     const uint4* xv = reinterpret_cast<const uint4*>(x + (size_t)row * H);
+    const uint4* rv = reinterpret_cast<const uint4*>(r + (size_t)row * H);
     const uint4* wv = reinterpret_cast<const uint4*>(w);
     uint4* ov = reinterpret_cast<uint4*>(out + (size_t)row * H);
+    uint4* sv = reinterpret_cast<uint4*>(sum + (size_t)row * H);
     float ss = 0.f;
     for (int i = lane; i < nv; i += 32) {
         float f[VEC];
         unpack8(xv[i], f);
+        if constexpr (RES) {
+            float g[VEC];
+            unpack8(rv[i], g);
+#pragma unroll
+            for (int j = 0; j < VEC; ++j) f[j] = rb(f[j] + g[j]);
+            sv[i] = pack8(f);
+        }
 #pragma unroll
         for (int j = 0; j < VEC; ++j) ss += f[j] * f[j];
     }
     const float inv = rsqrtf(warp_sum(ss) / (float)H + eps);
     for (int i = lane; i < nv; i += 32) {
         float f[VEC], g[VEC];
-        unpack8(xv[i], f);
+        unpack8(RES ? sv[i] : xv[i], f);    // RES: this lane's own write from the first pass
         unpack8(wv[i], g);
 #pragma unroll
-        for (int j = 0; j < VEC; ++j) f[j] = g[j] * rb(f[j] * inv);
+        for (int j = 0; j < VEC; ++j) f[j] = ZC ? f[j] * inv * (1.f + g[j]) : g[j] * rb(f[j] * inv);
         ov[i] = pack8(f);
     }
 }
@@ -169,18 +181,29 @@ select_greedy_kernel(const float* __restrict__ unary, const int64_t* __restrict_
 
 }  // namespace
 
-torch::Tensor rmsnorm_fused(torch::Tensor x, torch::Tensor w, double eps) {
+std::vector<torch::Tensor> rmsnorm_fused(torch::Tensor x, torch::Tensor w, double eps, c10::optional<torch::Tensor> residual,
+                                         bool zero_centered) {
     TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kBFloat16 && w.scalar_type() == at::kBFloat16);
     TORCH_CHECK(x.dim() == 2 && x.is_contiguous() && w.is_contiguous() && x.size(1) % VEC == 0 && w.numel() == x.size(1));
+    const bool res = residual.has_value();
+    if (res) TORCH_CHECK(residual->sizes() == x.sizes() && residual->is_contiguous() && residual->scalar_type() == at::kBFloat16);
     const c10::cuda::CUDAGuard guard(x.device());
     auto out = torch::empty_like(x);
+    auto sum = res ? torch::empty_like(x) : torch::Tensor();
     const int N = x.size(0), H = x.size(1);
-    if (N == 0) return out;
+    if (N == 0) return {out, sum};
     auto stream = at::cuda::getCurrentCUDAStream();
-    rmsnorm_kernel<<<(N + NORM_WARPS - 1) / NORM_WARPS, NORM_WARPS * 32, 0, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), reinterpret_cast<const __nv_bfloat16*>(w.data_ptr()),
-        reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), N, H, (float)eps);
-    return out;
+    const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr());
+    const auto* rp = res ? reinterpret_cast<const __nv_bfloat16*>(residual->data_ptr()) : nullptr;
+    const auto* wp = reinterpret_cast<const __nv_bfloat16*>(w.data_ptr());
+    auto* op = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
+    auto* sp = res ? reinterpret_cast<__nv_bfloat16*>(sum.data_ptr()) : nullptr;
+    const dim3 grid((N + NORM_WARPS - 1) / NORM_WARPS), block(NORM_WARPS * 32);
+    if (zero_centered && res) rmsnorm_kernel<true, true><<<grid, block, 0, stream>>>(xp, rp, wp, op, sp, N, H, (float)eps);
+    else if (zero_centered) rmsnorm_kernel<true, false><<<grid, block, 0, stream>>>(xp, rp, wp, op, sp, N, H, (float)eps);
+    else if (res) rmsnorm_kernel<false, true><<<grid, block, 0, stream>>>(xp, rp, wp, op, sp, N, H, (float)eps);
+    else rmsnorm_kernel<false, false><<<grid, block, 0, stream>>>(xp, rp, wp, op, sp, N, H, (float)eps);
+    return {out, sum};
 }
 
 torch::Tensor dyn_conv2(torch::Tensor x, torch::Tensor dyn, int64_t dyn_off, torch::Tensor base, int64_t group) {

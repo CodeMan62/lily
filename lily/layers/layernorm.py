@@ -27,13 +27,13 @@ class RMSNorm(nn.Module):
     def forward(
         self, x: torch.Tensor, residual: Optional[torch.Tensor] = None
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if x.dtype == torch.bfloat16:
+            out = cuda_ops.rmsnorm(x, self.weight, self.variance_epsilon, residual, self.zero_centered)  # one kernel instead of ~8
+            if out is not None:
+                return out
         if residual is not None:
             x = x + residual
             residual = x
-        elif not self.zero_centered and x.dtype == torch.bfloat16:
-            out = cuda_ops.rmsnorm(x, self.weight, self.variance_epsilon)        # one kernel instead of ~8
-            if out is not None:
-                return out
         orig_dtype = x.dtype
         xf = x.to(torch.float32)
         variance = xf.pow(2).mean(dim=-1, keepdim=True)

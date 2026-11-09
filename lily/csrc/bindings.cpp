@@ -61,7 +61,8 @@ bool bf16_skinny_supported(int64_t M, int64_t N, int64_t K);
 torch::Tensor bf16_skinny(torch::Tensor x, torch::Tensor w);
 void l2_prefetch(torch::Tensor w, int64_t blocks);
 
-torch::Tensor rmsnorm_fused(torch::Tensor x, torch::Tensor w, double eps);
+std::vector<torch::Tensor> rmsnorm_fused(torch::Tensor x, torch::Tensor w, double eps, c10::optional<torch::Tensor> residual,
+                                         bool zero_centered);
 torch::Tensor dyn_conv2(torch::Tensor x, torch::Tensor dyn, int64_t dyn_off, torch::Tensor base, int64_t group);
 std::vector<torch::Tensor> rope_neox(torch::Tensor q, torch::Tensor k, torch::Tensor cos_sin, torch::Tensor pos);
 bool select_greedy_supported(int64_t K, int64_t R);
@@ -71,7 +72,7 @@ std::vector<torch::Tensor> select_greedy(torch::Tensor unary, torch::Tensor cand
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("bf16_skinny_supported", &bf16_skinny_supported);
     m.def("l2_prefetch", &l2_prefetch);
-    m.def("rmsnorm_fused", &rmsnorm_fused, "RMSNorm of bf16 rows (fp32 variance, HF rounding)");
+    m.def("rmsnorm_fused", &rmsnorm_fused, "RMSNorm of bf16 rows (fp32 variance, HF rounding), optional zero-centered weight and fused residual add");
     m.def("dyn_conv2", &dyn_conv2, "DFlash two-tap grouped dynamic causal conv over a block");
     m.def("rope_neox", &rope_neox, "Neox rotary over whole heads of q and k (bf16 cache)");
     m.def("select_greedy_supported", &select_greedy_supported);

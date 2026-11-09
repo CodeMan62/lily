@@ -80,6 +80,11 @@ def test_small_fused_matches_torch():
     w = (torch.rand(512, generator=gen) + 0.5).bfloat16().cuda()
     want = w * (x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + 1e-5)).bfloat16()
     assert torch.equal(cuda_ops.rmsnorm(x, w, 1e-5), want)
+    r = torch.randn(37, 512, generator=gen).bfloat16().cuda()
+    s = x + r                                   # zero-centered (Qwen3.5) with the fused residual add
+    want = (s.float() * torch.rsqrt(s.float().pow(2).mean(-1, keepdim=True) + 1e-5) * (1.0 + w.float())).bfloat16()
+    got = cuda_ops.rmsnorm(x, w, 1e-5, r, zero_centered=True)
+    assert torch.equal(got[0], want) and torch.equal(got[1], s)
     rope = RotaryEmbedding(128, 128, 4096, 10000.0, dtype=torch.bfloat16).cuda()
     pos = torch.randint(0, 4096, (24,), generator=gen).cuda()
     q, k = (torch.randn(24, h * 128, generator=gen).bfloat16().cuda() for h in (8, 2))

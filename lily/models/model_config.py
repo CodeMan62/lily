@@ -63,6 +63,7 @@ class ModelConfig:
     mamba_ssm_dtype: Optional[str] = None
     # Online quantization of lm_head when the checkpoint left it in bf16 (set by ModelRunner).
     lm_head_quantization: Optional[str] = None
+    draft_quantization: Optional[str] = None   # same for the MTP head
     # Multi-token-prediction head shipped in the checkpoint (Qwen3.5/3.8: one layer) and
     # whether to build it (set by ModelRunner from --speculative-algorithm).
     mtp_num_hidden_layers: int = 0

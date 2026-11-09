@@ -173,11 +173,16 @@ def _bf16_cuda(*tensors) -> bool:
     return _module() is not None and all(t.is_cuda and t.dtype == torch.bfloat16 for t in tensors)
 
 
-def rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float) -> Optional[torch.Tensor]:
-    """w * bf16(x * rsqrt(mean(x^2) + eps)) over the last dim; None when unavailable."""
-    if not _bf16_cuda(x, w) or x.shape[-1] % 8:
+def rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float, residual: Optional[torch.Tensor] = None,
+            zero_centered: bool = False):
+    """w * bf16(x * rsqrt(mean(x^2) + eps)) over the last dim (zero_centered: bf16(... * (1 + w)) in fp32);
+    with residual, normalizes x + residual and returns (normed, x + residual). None when unavailable."""
+    if not _bf16_cuda(x, w) or x.shape[-1] % 8 or (residual is not None and residual.dtype != torch.bfloat16):
         return None
-    return _module().rmsnorm_fused(x.reshape(-1, x.shape[-1]).contiguous(), w, float(eps)).view(x.shape)
+    H = x.shape[-1]
+    r = residual.reshape(-1, H).contiguous() if residual is not None else None
+    out, s = _module().rmsnorm_fused(x.reshape(-1, H).contiguous(), w, float(eps), r, zero_centered)
+    return out.view(x.shape) if r is None else (out.view(x.shape), s.view(x.shape))
 
 
 def dyn_conv2(x: torch.Tensor, dyn: torch.Tensor, dyn_off: int, base: torch.Tensor, group: int) -> Optional[torch.Tensor]:

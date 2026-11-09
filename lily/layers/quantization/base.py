@@ -238,6 +238,21 @@ class OnlineNVFP4LinearMethod(NVFP4LinearMethod):
         torch.cuda.empty_cache()
 
 
+class OnlineNVFP4Config(QuantizationConfig):
+    """Every linear NVFP4-quantized at load from its bf16 checkpoint weight (`--quantize-draft nvfp4`)."""
+
+    @classmethod
+    def get_name(cls) -> str:
+        return "nvfp4_online"
+
+    @classmethod
+    def from_config(cls, config: Dict[str, Any]) -> "OnlineNVFP4Config":
+        return cls()
+
+    def get_quant_method(self, layer: nn.Module, prefix: str) -> Optional[LinearMethodBase]:
+        return OnlineNVFP4LinearMethod()
+
+
 class NVFP4Config(_IgnoredPrefixConfig):
     """compressed-tensors `nvfp4-pack-quantized` checkpoint config."""
 

@@ -61,6 +61,7 @@ class ModelRunner:
 
         self.quant_config = build_quant_config(server_args.quantization, model_config)
         model_config.lm_head_quantization = server_args.quantize_lm_head
+        model_config.draft_quantization = server_args.quantize_draft
         model_config.enable_mtp = (
             server_args.speculative_algorithm in ("NEXTN", "MTP") and model_config.mtp_num_hidden_layers >= 1)
         if server_args.speculative_algorithm in ("NEXTN", "MTP") and not model_config.enable_mtp:

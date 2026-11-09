@@ -56,6 +56,20 @@ class TritonAttnBackend(AttentionBackend):
 
         prefix_lens = forward_batch.extend_prefix_lens
         static = forward_batch.graph_static
+        if static is not None and "split_kv_rows" in static:
+            # Speculative verify (n tokens per request, cache rows already written): each token is a
+            # decode row over prefix + i + 1 keys, so the split-KV decode kernel spreads a long context
+            # over the whole GPU instead of one block per head scanning it all.
+            n = static["n"]
+            if static.get("attn_logits") is None:
+                static["attn_logits"] = torch.empty((static["split_kv_rows"], self.num_q_heads, self.num_kv_splits,
+                                                     self.v_head_dim + 1), dtype=torch.float32, device=self.device)
+            rows = bs * n
+            seq = static["row_seq_lens"][:rows].view(bs, n)
+            seq.copy_(prefix_lens.view(bs, 1) + static["row_offsets"])
+            self.forward_metadata = ("rows", static["attn_logits"][:rows],
+                                     forward_batch.req_pool_indices.repeat_interleave(n), seq.view(-1), None)
+            return
         if static is not None:
             # Fixed-shape extend inside a CUDA graph: cumsum + gather into preallocated
             # buffers, no host sync (kv_indices is sized for the whole context).
@@ -86,6 +100,17 @@ class TritonAttnBackend(AttentionBackend):
     def forward_extend(self, q, k, v, layer, forward_batch, save_kv_cache=True):
         if save_kv_cache:
             self.token_to_kv_pool.set_kv_buffer(layer.layer_id, forward_batch.out_cache_loc, k, v)
+        if self.forward_metadata[0] == "rows":
+            _, attn_logits, row_req_idx, row_seq_lens, _ = self.forward_metadata
+            o = torch.empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim), dtype=q.dtype, device=q.device)
+            decode_attention_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                self.req_to_token, row_req_idx, row_seq_lens, attn_logits, self.num_kv_splits, layer.scaling,
+            )
+            return o
         _, kv_indptr, kv_indices, qo_indptr, max_extend_len = self.forward_metadata
         o = torch.empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim), dtype=q.dtype, device=q.device)
         extend_attention_fwd(

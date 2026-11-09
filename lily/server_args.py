@@ -30,6 +30,7 @@ class ServerArgs:
     kv_cache_dtype: str = "auto"  # auto | fp8_e4m3
     mamba_ssm_dtype: str = "auto"  # auto (checkpoint config, else float32) | float32 | bfloat16
     quantize_lm_head: Optional[str] = None  # nvfp4: quantize a bf16 lm_head at load (248k-vocab heads read 2.5 GB/token in bf16)
+    quantize_draft: Optional[str] = None  # nvfp4: quantize the bf16 MTP head at load (it runs k times per round)
 
     # Memory
     mem_fraction_static: Optional[float] = None
@@ -131,6 +132,8 @@ class ServerArgs:
             raise ValueError(f"Unknown dtype {self.dtype!r}")
         if self.quantize_lm_head is not None and self.quantize_lm_head != "nvfp4":
             raise ValueError(f"Unknown quantize_lm_head {self.quantize_lm_head!r}; supported: nvfp4")
+        if self.quantize_draft is not None and self.quantize_draft != "nvfp4":
+            raise ValueError(f"Unknown quantize_draft {self.quantize_draft!r}; supported: nvfp4")
         if self.mamba_ssm_dtype not in ("auto", "float32", "bfloat16"):
             raise ValueError(f"Unknown mamba_ssm_dtype {self.mamba_ssm_dtype!r}")
         if self.quantization is not None and self.quantization not in SUPPORTED_QUANTIZATION:

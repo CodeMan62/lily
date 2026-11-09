@@ -21,6 +21,7 @@ from typing import Dict, List, Optional
 
 import torch
 
+from lily.layers.attention.triton_backend import TritonAttnBackend
 from lily.layers.logits_processor import LogitsProcessorOutput
 from lily.model_executor.cuda_graph_runner import capture_buckets, seq_len_fill, warmup_and_capture
 from lily.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -69,6 +70,11 @@ class VerifyGraphRunner:
             "kv_indices": torch.zeros(self.max_bs * ctx, dtype=torch.int32, device=self.device),
             "qo_indptr": torch.arange(0, (self.max_bs + 1) * self.n, self.n, dtype=torch.int32, device=self.device),
         }
+        if isinstance(model_runner.attn_backend, TritonAttnBackend):
+            # verify tokens as split-KV decode rows (see TritonAttnBackend.init_forward_metadata)
+            self.static_meta.update(n=self.n, split_kv_rows=self.max_bs * self.n, attn_logits=None,
+                                    row_seq_lens=torch.zeros(self.max_bs * self.n, dtype=torch.int64, device=self.device),
+                                    row_offsets=torch.arange(1, self.n + 1, dtype=torch.int64, device=self.device))
         self.graphs: Dict[int, torch.cuda.CUDAGraph] = {}
         self.buffers: Dict[int, _VerifyBuffers] = {}
         self.batches: Dict[int, ForwardBatch] = {}

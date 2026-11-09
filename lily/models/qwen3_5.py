@@ -38,7 +38,7 @@ from lily.layers.linear import (
     RowParallelLinear,
 )
 from lily.layers.quantization import cuda_ops
-from lily.layers.quantization.base import QuantizationConfig
+from lily.layers.quantization.base import OnlineNVFP4Config, QuantizationConfig
 from lily.model_executor.forward_batch_info import ForwardBatch
 from lily.models.llama import LlamaAttention, LlamaDecoderLayer, LlamaForCausalLMBase, LlamaMLP, LlamaModel
 from lily.models.model_config import ModelConfig
@@ -397,7 +397,8 @@ class Qwen3_5MTP(nn.Module):
         self.pre_fc_norm_hidden = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, zero_centered=True)
         self.fc = ReplicatedLinear(2 * config.hidden_size, config.hidden_size)
         self.layers = nn.ModuleList([Qwen3_5DecoderLayer(
-            config, self.layer_id, quant_config=None, prefix=f"{prefix}.layers.0", block_type="full_attention")])
+            config, self.layer_id, quant_config=OnlineNVFP4Config() if config.draft_quantization == "nvfp4" else None,
+            prefix=f"{prefix}.layers.0", block_type="full_attention")])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, zero_centered=True)
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor, hidden_states: torch.Tensor,
