@@ -54,7 +54,7 @@ def main() -> None:
         print("bot> ", end="", flush=True)
         extra: dict = {"top_p": args.top_p, "extra_body": {"top_k": args.top_k}}
         if args.no_think:
-            extra["chat_template_kwargs"] = {"enable_thinking": False}
+            extra["extra_body"]["chat_template_kwargs"] = {"enable_thinking": False}
 
         if args.no_stream:
             reply = client.chat.completions.create(
