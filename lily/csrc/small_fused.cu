@@ -7,6 +7,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cfloat>
 
@@ -35,18 +36,17 @@ __device__ __forceinline__ float warp_sum(float v) {
     return v;
 }
 
-// ---- RMSNorm: one warp per row --------------------------------------------------------------------------
+// ---- RMSNorm: one block per row (up to 256 threads: a few decode rows still spread over SMs) ------------
 // out = w * bf16(x * rsqrt(mean(x^2) + eps)): the variance in fp32, then the HF rounding order.
 // ZC (zero-centered, Qwen3.5): out = bf16(x * rsqrt(...) * (1 + w)) all in fp32.
 // RES: x = bf16(x + r) first, written to `sum` (the new residual stream).
-constexpr int NORM_WARPS = 8;
+constexpr int NORM_THREADS = 256;
 
 template <bool ZC, bool RES>
-__global__ void __launch_bounds__(NORM_WARPS * 32)
+__global__ void __launch_bounds__(NORM_THREADS)
 rmsnorm_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ r, const __nv_bfloat16* __restrict__ w,
                __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ sum, int N, int H, float eps) {
-    const int row = blockIdx.x * NORM_WARPS + (threadIdx.x >> 5), lane = threadIdx.x & 31;
-    if (row >= N) return;
+    const int row = blockIdx.x, lane = threadIdx.x, nt = blockDim.x;
     const int nv = H / VEC;
     const uint4* xv = reinterpret_cast<const uint4*>(x + (size_t)row * H);
     const uint4* rv = reinterpret_cast<const uint4*>(r + (size_t)row * H);
@@ -54,7 +54,7 @@ rmsnorm_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restr
     uint4* ov = reinterpret_cast<uint4*>(out + (size_t)row * H);
     uint4* sv = reinterpret_cast<uint4*>(sum + (size_t)row * H);
     float ss = 0.f;
-    for (int i = lane; i < nv; i += 32) {
+    for (int i = lane; i < nv; i += nt) {
         float f[VEC];
         unpack8(xv[i], f);
         if constexpr (RES) {
@@ -67,8 +67,14 @@ rmsnorm_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restr
 #pragma unroll
         for (int j = 0; j < VEC; ++j) ss += f[j] * f[j];
     }
-    const float inv = rsqrtf(warp_sum(ss) / (float)H + eps);
-    for (int i = lane; i < nv; i += 32) {
+    __shared__ float part[NORM_THREADS / 32];
+    ss = warp_sum(ss);
+    if ((lane & 31) == 0) part[lane >> 5] = ss;
+    __syncthreads();
+    ss = 0.f;
+    for (int i = 0; i < nt / 32; ++i) ss += part[i];
+    const float inv = rsqrtf(ss / (float)H + eps);
+    for (int i = lane; i < nv; i += nt) {
         float f[VEC], g[VEC];
         unpack8(RES ? sv[i] : xv[i], f);    // RES: this lane's own write from the first pass
         unpack8(wv[i], g);
@@ -198,7 +204,7 @@ std::vector<torch::Tensor> rmsnorm_fused(torch::Tensor x, torch::Tensor w, doubl
     const auto* wp = reinterpret_cast<const __nv_bfloat16*>(w.data_ptr());
     auto* op = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
     auto* sp = res ? reinterpret_cast<__nv_bfloat16*>(sum.data_ptr()) : nullptr;
-    const dim3 grid((N + NORM_WARPS - 1) / NORM_WARPS), block(NORM_WARPS * 32);
+    const dim3 grid(N), block(std::min(NORM_THREADS, (H / VEC + 31) / 32 * 32));
     if (zero_centered && res) rmsnorm_kernel<true, true><<<grid, block, 0, stream>>>(xp, rp, wp, op, sp, N, H, (float)eps);
     else if (zero_centered) rmsnorm_kernel<true, false><<<grid, block, 0, stream>>>(xp, rp, wp, op, sp, N, H, (float)eps);
     else if (res) rmsnorm_kernel<false, true><<<grid, block, 0, stream>>>(xp, rp, wp, op, sp, N, H, (float)eps);

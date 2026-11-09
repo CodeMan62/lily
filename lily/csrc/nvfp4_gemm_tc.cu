@@ -68,6 +68,24 @@ __device__ __forceinline__ uint32_t e2m1x2_to_bf16x2_bits(uint32_t byte) {
     return e2m1_to_bf16_bits(byte & 0xFu) | (e2m1_to_bf16_bits(byte >> 4) << 16);
 }
 
+__device__ __forceinline__ uint32_t prmt(uint32_t a, uint32_t b, uint32_t sel) {
+    uint32_t r;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(sel));
+    return r;
+}
+
+// Four E2M1 nibbles (16 bits, nibble i = element i) -> two bf16x2 words {e0, e1}, {e2, e3}, bit-identical
+// to e2m1_to_bf16_bits. Every magnitude's bf16 is a (hi, lo) byte pair from an 8-entry table, so two
+// byte-permutes look up all four at once (~11 ops instead of ~36); the sign bits go to bits 15/31 with
+// one multiply (the stray product bits are masked off).
+__device__ __forceinline__ void e2m1x4_to_bf16x2x2(uint32_t v, uint32_t& w01, uint32_t& w23) {
+    const uint32_t idx = v & 0x7777u;
+    const uint32_t hi = prmt(0x3F3F3F00u, 0x40404040u, idx);   // codes 0..7: 00 3F 3F 3F 40 40 40 40
+    const uint32_t lo = prmt(0xC0800000u, 0xC0804000u, idx);   //             00 00 80 C0 00 40 80 C0
+    w01 = prmt(lo, hi, 0x5140u) | (((v & 0x0088u) * 0x01001000u) & 0x80008000u);
+    w23 = prmt(lo, hi, 0x7362u) | (((v & 0x8800u) * 0x00010010u) & 0x80008000u);
+}
+
 __device__ __forceinline__ uint32_t bf16x2_mul(uint32_t a_bits, __nv_bfloat162 s) {
     // E2M1 (<= 2 significant bits) times an e4m3 scale (<= 4) is exact in bf16 (8 bits):
     // this multiply introduces no rounding, so the path matches the fp32 GEMV exactly.
@@ -101,31 +119,51 @@ nvfp4_gemm_tc_kernel(const __nv_bfloat16* __restrict__ x,   // [M, K]
 
     float acc[4] = {0.f, 0.f, 0.f, 0.f};
 
+    // this lane: 32 nibbles of row n_row at K offsets [ks + 32t, ks + 32t + 32); the next super-step's
+    // weights and scales are loaded before this one's math so a load is always in flight
+    uint4 packed_next = *reinterpret_cast<const uint4*>(wrow + (k0 + 32 * t) / 2);
+    uint32_t s2_next = *reinterpret_cast<const uint16_t*>(srow + (k0 + 32 * t) / 16);
     for (int ks = k0; ks < k1; ks += SUPER_K) {
-        // this lane: 32 nibbles of row n_row at K offsets [ks + 32t, ks + 32t + 32)
-        const uint4 packed = *reinterpret_cast<const uint4*>(wrow + (ks + 32 * t) / 2);
+        const uint4 packed = packed_next;
+        const uint32_t s2 = s2_next;
+        const int kn = ks + SUPER_K < k1 ? ks + SUPER_K : ks;
+        packed_next = *reinterpret_cast<const uint4*>(wrow + (kn + 32 * t) / 2);
+        s2_next = *reinterpret_cast<const uint16_t*>(srow + (kn + 32 * t) / 16);
         const uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
-        const uint32_t s2 = *reinterpret_cast<const uint16_t*>(srow + (ks + 32 * t) / 16);
         // block scales as bf16x2 (exact: an e4m3 value fits in bf16)
         const __nv_bfloat162 sc[2] = {__float2bfloat162_rn(e4m3_to_float(s2 & 0xFFu)),
                                       __float2bfloat162_rn(e4m3_to_float((s2 >> 8) & 0xFFu))};
-        const __nv_bfloat16* xa_s = xa + ks + 32 * t;
-        const __nv_bfloat16* xb_s = xb + ks + 32 * t;
+        // A: this lane's x[g][32t .. 32t+31] (and row g+8) as 4 x 16 B instead of 8 x 8 B per row: half
+        // the L1 sectors. With M <= 8 the g+8 half of the mma is padding, so it is not loaded at all.
+        uint32_t xa_w[16], xb_w[16];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint4 v = *reinterpret_cast<const uint4*>(xa + ks + 32 * t + 8 * i);
+            xa_w[4 * i] = v.x; xa_w[4 * i + 1] = v.y; xa_w[4 * i + 2] = v.z; xa_w[4 * i + 3] = v.w;
+        }
+        if (M > 8) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const uint4 v = *reinterpret_cast<const uint4*>(xb + ks + 32 * t + 8 * i);
+                xb_w[4 * i] = v.x; xb_w[4 * i + 1] = v.y; xb_w[4 * i + 2] = v.z; xb_w[4 * i + 3] = v.w;
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < 16; ++i) xb_w[i] = 0u;
+        }
 
 #pragma unroll
         for (int c = 0; c < 8; ++c) {
-            // nibbles 4c..4c+3 = bytes 2c, 2c+1 = word c/2, bytes (2c)%4, (2c)%4+1
-            const uint32_t word = words[c >> 1];
-            const uint32_t b0 = (word >> (8 * ((2 * c) & 3))) & 0xFFu;
-            const uint32_t b1 = (word >> (8 * ((2 * c + 1) & 3))) & 0xFFu;
+            // nibbles 4c..4c+3 = bytes 2c, 2c+1 = half c%2 of word c/2
+            const uint32_t nib4 = (words[c >> 1] >> (16 * (c & 1))) & 0xFFFFu;
             const __nv_bfloat162 s = sc[c >> 2];
+            uint32_t w01, w23;
+            e2m1x4_to_bf16x2x2(nib4, w01, w23);
             uint32_t bfrag[2];
-            bfrag[0] = bf16x2_mul(e2m1x2_to_bf16x2_bits(b0), s);
-            bfrag[1] = bf16x2_mul(e2m1x2_to_bf16x2_bits(b1), s);
+            bfrag[0] = bf16x2_mul(w01, s);
+            bfrag[1] = bf16x2_mul(w23, s);
             // A: x[g][32t+4c .. +3] -> a0 (first pair), a2 (second pair); same for row g+8 -> a1, a3
-            const uint2 ra = *reinterpret_cast<const uint2*>(xa_s + 4 * c);
-            const uint2 rb = *reinterpret_cast<const uint2*>(xb_s + 4 * c);
-            const uint32_t afrag[4] = {ra.x, rb.x, ra.y, rb.y};
+            const uint32_t afrag[4] = {xa_w[2 * c], xb_w[2 * c], xa_w[2 * c + 1], xb_w[2 * c + 1]};
             mma_16816_bf16(acc, afrag, bfrag);
         }
     }
@@ -181,7 +219,7 @@ torch::Tensor nvfp4_gemm_tc(torch::Tensor x, torch::Tensor w, torch::Tensor scal
     TORCH_CHECK(nvfp4_gemm_tc_supported(M, K), "nvfp4_gemm_tc: needs 1 <= M <= 16 and K % 128 == 0 (M=", M, ", K=", K, ")");
     TORCH_CHECK(w.size(1) * 2 == K && scale.size(0) == N && scale.size(1) * 16 == K, "nvfp4_gemm_tc: shape mismatch");
     TORCH_CHECK(gscale.numel() == 1 || gscale.numel() == N, "nvfp4_gemm_tc: global scale must have 1 or N elements");
-    TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 8 == 0 && reinterpret_cast<uintptr_t>(w.data_ptr()) % 16 == 0,
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0 && reinterpret_cast<uintptr_t>(w.data_ptr()) % 16 == 0,
                 "nvfp4_gemm_tc: alignment");
 
     const c10::cuda::OptionalCUDAGuard guard(x.device());

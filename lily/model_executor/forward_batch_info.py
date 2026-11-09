@@ -86,6 +86,9 @@ class ForwardBatch:
     # Graph-captured fixed-shape extend (speculative verify): preallocated attention
     # metadata buffers {kv_indptr, kv_indices, qo_indptr} so no host sync is needed.
     graph_static: Any = None
+    # Small extend whose slots are already in req_to_token (MTP refresh): attention runs each token
+    # as a split-KV decode row instead of through the prefill kernel.
+    extend_as_decode_rows: bool = False
 
     def linear_attention_meta(self):
         """(tok_starts int32 [bs], tok_lens int32 [bs], slots int64 [bs], fresh uint8 [bs] | None) for the

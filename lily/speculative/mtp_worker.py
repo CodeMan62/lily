@@ -156,7 +156,7 @@ class MTPSpecWorker(SpecWorkerBase):
         ext = [j + 1 for j in num_acc]
         loc = torch.cat([slots[i, :ext[i]] for i in range(B)])
         req_idx = torch.tensor([r.req_pool_idx for r in reqs], dtype=torch.int64, device=dev)
-        fb_r = self._extend_batch(refresh_ids, req_idx, m, ext, loc)
+        fb_r = self._extend_batch(refresh_ids, req_idx, m, ext, loc, extend_as_decode_rows=True)
         h = self.runner.forward_mtp(fb_r, hidden.index_select(0, torch.tensor(hidden_rows, dtype=torch.int64, device=dev)))
         last = fb_r.extend_start_loc + fb_r.extend_seq_lens - 1
         self._store_draft(reqs, h[last], sampling, [len(a) for a in accepted])

@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
 
 class TritonAttnBackend(AttentionBackend):
-    def __init__(self, model_runner: "ModelRunner", num_kv_splits: int = 8, kv_pool=None):
+    def __init__(self, model_runner: "ModelRunner", num_kv_splits: int = 32, kv_pool=None):
         self.device = model_runner.device
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         # `kv_pool` lets a second backend serve another KV pool over the same
@@ -68,7 +68,17 @@ class TritonAttnBackend(AttentionBackend):
             seq = static["row_seq_lens"][:rows].view(bs, n)
             seq.copy_(prefix_lens.view(bs, 1) + static["row_offsets"])
             self.forward_metadata = ("rows", static["attn_logits"][:rows],
-                                     forward_batch.req_pool_indices.repeat_interleave(n), seq.view(-1), None)
+                                     forward_batch.req_pool_indices.repeat_interleave(n), seq.view(-1), n)
+            return
+        if forward_batch.extend_as_decode_rows:
+            T = forward_batch.extend_num_tokens
+            lens = forward_batch.extend_seq_lens
+            start = forward_batch.extend_start_loc.repeat_interleave(lens, output_size=T)
+            seq = prefix_lens.repeat_interleave(lens, output_size=T) + torch.arange(T, device=self.device) - start + 1
+            attn_logits = torch.empty((T, self.num_q_heads, self.num_kv_splits, self.v_head_dim + 1),
+                                      dtype=torch.float32, device=self.device)
+            self.forward_metadata = ("rows", attn_logits, forward_batch.req_pool_indices.repeat_interleave(lens, output_size=T),
+                                     seq, 1)
             return
         if static is not None:
             # Fixed-shape extend inside a CUDA graph: cumsum + gather into preallocated
@@ -101,14 +111,14 @@ class TritonAttnBackend(AttentionBackend):
         if save_kv_cache:
             self.token_to_kv_pool.set_kv_buffer(layer.layer_id, forward_batch.out_cache_loc, k, v)
         if self.forward_metadata[0] == "rows":
-            _, attn_logits, row_req_idx, row_seq_lens, _ = self.forward_metadata
+            _, attn_logits, row_req_idx, row_seq_lens, rows = self.forward_metadata
             o = torch.empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim), dtype=q.dtype, device=q.device)
             decode_attention_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                 self.token_to_kv_pool.get_key_buffer(layer.layer_id),
                 self.token_to_kv_pool.get_value_buffer(layer.layer_id),
                 o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                self.req_to_token, row_req_idx, row_seq_lens, attn_logits, self.num_kv_splits, layer.scaling,
+                self.req_to_token, row_req_idx, row_seq_lens, attn_logits, self.num_kv_splits, layer.scaling, rows=rows,
             )
             return o
         _, kv_indptr, kv_indices, qo_indptr, max_extend_len = self.forward_metadata
