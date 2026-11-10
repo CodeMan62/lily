@@ -26,7 +26,7 @@ class ServerArgs:
 
     # Backends / quantization
     attention_backend: str = "triton"  # triton | torch_native
-    quantization: Optional[str] = None  # fp8 | w8a16 | w4a16 (weight-only, online at load time)
+    quantization: Optional[str] = None  # fp8 | w8a16 | w4a16 | nf12 (weight-only, online at load time; nf12 is lossless, needs `pip install lily[nf12]`)
     kv_cache_dtype: str = "auto"  # auto | fp8_e4m3
     mamba_ssm_dtype: str = "auto"  # auto (checkpoint config, else float32) | float32 | bfloat16
     quantize_lm_head: Optional[str] = None  # nvfp4: quantize a bf16 lm_head at load (248k-vocab heads read 2.5 GB/token in bf16)

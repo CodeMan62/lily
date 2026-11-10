@@ -17,6 +17,9 @@ dependencies = [
     "ninja>=1.13.2",
 ]
 
+[project.optional-dependencies]
+nf12 = ["nf12>=1.0.1"]  # --quantization nf12 (sm80+)
+
 [dependency-groups]
 dev = [
     "httpx>=0.28.1",
