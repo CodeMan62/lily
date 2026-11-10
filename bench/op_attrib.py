@@ -42,6 +42,7 @@ if __name__ == "__main__":
     tiny = SmallQwen35()
     sched = _scheduler(str(tiny.path), True, k=k, algo="DFLASH", max_reqs=bs, draft=tiny.build_dflash())
     sched.model_runner.server_args.disable_cuda_graph = True
+    sched.worker.spec.verify_graphs = sched.worker.spec.draft_graphs = None     # count every launch, not just graph replays
     for i in range(bs):
         sched.add_request(f"r{i}", [5 + i, 9, 12, 7, 3, 40 + i], SamplingParams(max_new_tokens=40, ignore_eos=True))
     for _ in range(4):
