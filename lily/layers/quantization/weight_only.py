@@ -11,6 +11,8 @@ Storage per method (weights quantized symmetrically along the output dim):
   w8a16 : int8 weight [N, K] + fp32 per-channel scale [N] (range [-127, 127])
   w4a16 : uint8 packed int4 [N, K/2] (two nibbles per byte, low=2i, high=2i+1,
           stored as q+8) + fp32 group scale [N, K/group_size]
+  nf12  : lossless 12-bit bf16 (github.com/dphnAI/nf12, sm80+): uint8 packed [N, 3K/2]
+          + int16 escapes [E, 8] + int exp_base; shapes off the N%16 / K%64 grid stay bf16
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ from lily.layers.quantization.base import (
     LinearMethodBase,
     PackedWeightLinearMethod,
     QuantizationConfig,
+    UnquantizedLinearMethod,
     unpack_int4_weight,
 )
 from lily.layers.quantization.kernels import FAMILY_FP8, FAMILY_INT4, FAMILY_INT8, weight_only_matmul
@@ -133,6 +136,24 @@ class W4A16LinearMethod(WeightOnlyLinearMethod):
                                   FAMILY_INT4, self.group_size)
 
 
+class NF12LinearMethod(WeightOnlyLinearMethod):
+    """Lossless NF12 encoding of the bf16 weight (`pip install nf12`); its fused decode-GEMM reads 25% fewer bytes."""
+
+    def process_weights_after_loading(self, layer):
+        n, k = layer.weight.shape
+        if layer.weight.dtype != torch.bfloat16 or n % 16 or k % 64:
+            return  # stays bf16
+        import nf12
+        nw = nf12.encode(layer.weight.data)
+        layer._parameters.pop("weight", None)
+        layer.nf12_packed, layer.nf12_escapes, layer.nf12_exp_base = nw.packed, nw.escapes, nw.exp_base
+
+    def apply(self, layer, x, bias=None):
+        if "weight" in layer._parameters:
+            return UnquantizedLinearMethod.apply(self, layer, x, bias)
+        return torch.ops.nf12.linear(x, layer.nf12_packed, layer.nf12_escapes, layer.nf12_exp_base, bias)
+
+
 class _OnlineQuantConfig(QuantizationConfig):
     """Parameterless online method selected by name."""
 
@@ -154,6 +175,11 @@ class _OnlineQuantConfig(QuantizationConfig):
 class W8A16Config(_OnlineQuantConfig):
     name = "w8a16"
     method_cls = W8A16LinearMethod
+
+
+class NF12Config(_OnlineQuantConfig):
+    name = "nf12"
+    method_cls = NF12LinearMethod
 
 
 class FP8Config(_OnlineQuantConfig):

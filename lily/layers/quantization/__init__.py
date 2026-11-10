@@ -13,12 +13,13 @@ from lily.layers.quantization.base import (
     UnquantizedLinearMethod,
     get_linear_method,
 )
-from lily.layers.quantization.weight_only import FP8Config, W4A16Config, W8A16Config
+from lily.layers.quantization.weight_only import FP8Config, NF12Config, W4A16Config, W8A16Config
 
 _QUANT_CONFIGS = {
     "fp8": FP8Config,
     "w8a16": W8A16Config,
     "w4a16": W4A16Config,
+    "nf12": NF12Config,
 }
 SUPPORTED_QUANTIZATION = tuple(_QUANT_CONFIGS)
 
@@ -72,6 +73,7 @@ __all__ = [
     "FP8Config",
     "W4A16Config",
     "W8A16Config",
+    "NF12Config",
     "NVFP4Config",
     "CompressedInt4Config",
 ]
