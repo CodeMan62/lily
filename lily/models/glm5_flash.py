@@ -316,9 +316,12 @@ class DSAIndexer(nn.Module):
         pool_end = torch.arange(P, device=x.device) * kp + (kp - 1)
 
         q = self.wq_b(q_resid).view(Tq, self.n_heads, self.head_dim)
-        scores = F.relu(torch.matmul(q.float(), pool_keys.float().t().unsqueeze(0)) * self.softmax_scale)   # [Tq, Hh, P]
         w = self.weights_proj(x).float() * (self.n_heads ** -0.5)                   # [Tq, Hh]
-        index_scores = torch.einsum("th,thp->tp", w, scores)                         # [Tq, P]
+        pk = pool_keys.float().t().unsqueeze(0)
+        index_scores = torch.empty(Tq, P, dtype=torch.float32, device=x.device)
+        for a in range(0, Tq, 1024):        # [Tq, Hh, P] scores would be ~9 GB for an 8k chunk at 32k context
+            scores = F.relu(torch.matmul(q[a:a + 1024].float(), pk) * self.softmax_scale)   # [tq, Hh, P]
+            index_scores[a:a + 1024] = torch.einsum("th,thp->tp", w[a:a + 1024], scores)
         selectable = (pool_end.unsqueeze(0) <= q_pos.unsqueeze(1)) & pool_valid.unsqueeze(0)
         index_scores = index_scores.masked_fill(~selectable, torch.finfo(torch.float32).min)
         select_k = min(self.index_topk // kp, P)

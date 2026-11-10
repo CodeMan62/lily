@@ -105,9 +105,9 @@ def _generate_probe(base: str) -> bool:
         return False
 
 
-def _start_server(spec: str, log_path: str, t0: float, k: int = 0, graph_bs: int = 8) -> subprocess.Popen:
+def _start_server(spec: str, log_path: str, t0: float, k: int = 0, graph_bs: int = 8, context_len: int = 32768) -> subprocess.Popen:
     cmd = ["lily-serve", "--model-path", MODEL_DIR, "--served-model-name", "glm", "--tp-size", "4",
-           "--quantize-lm-head", "nvfp4", "--mamba-ssm-dtype", "bfloat16", "--context-length", "32768",
+           "--quantize-lm-head", "nvfp4", "--mamba-ssm-dtype", "bfloat16", "--context-length", str(context_len),
            "--max-running-requests", "16", "--max-total-tokens", "131072", "--cuda-graph-max-bs", str(graph_bs),
            "--mem-fraction-static", "0.8", "--port", str(PORT)]
     if spec == "dflash":
@@ -193,7 +193,8 @@ def lossless(spec: str = "dflash", output_len: int = 256, k: int = 5) -> None:
 @app.function(image=image, volumes={"/models": vol}, gpu=GPU, cpu=16, memory=65536, timeout=22 * 60)
 def bench(input_len: int = 256, output_len: int = 256, concurrency: str = "1,8", health_timeout: int = 12 * 60,
           spec: str = "", k: int = 0, random_prompts: bool = True, profile_bs: str = "", nccl_debug: bool = False,
-          graph_bs: int = 8, sweep_passes: int = 1, env: str = "", profile_trace: bool = False) -> dict:
+          graph_bs: int = 8, sweep_passes: int = 1, env: str = "", profile_trace: bool = False, prefill_lens: str = "",
+          context_len: int = 32768) -> dict:
     """`spec`: "" plain decode, "dflash" the DFlash 2 drafter (Volume), "mtp" the checkpoint's MTP head.
     `profile_bs`: e.g. "1,8": rank 0 logs a per-kernel GPU-time table of 20 decode steps at those batch sizes.
     `nccl_debug`: log NCCL's transport choice (P2P vs shared memory) at startup. `graph_bs`: CUDA-graph
@@ -220,7 +221,7 @@ def bench(input_len: int = 256, output_len: int = 256, concurrency: str = "1,8",
     for kv in filter(None, env.split(",")):           # e.g. "NCCL_P2P_LEVEL=SYS"
         key, _, value = kv.partition("=")
         os.environ[key] = value
-    proc = _start_server(spec, log_path, t_start, k, graph_bs)
+    proc = _start_server(spec, log_path, t_start, k, graph_bs, context_len)
     result: dict = {"gpu": GPU, "spec": spec, "k": k, "graph_bs": graph_bs}
     try:
         _wait_ready(proc, base, log_path, t_start, health_timeout)
@@ -263,6 +264,23 @@ def bench(input_len: int = 256, output_len: int = 256, concurrency: str = "1,8",
             result["http_real"] = asyncio.run(sweep(f"real pass {n + 1}", lambda i: real[i % len(real)]))
         if random_prompts:
             result["http"] = asyncio.run(sweep("random", lambda i: _random_ids(input_len, vocab, seed=10_000 + i)))
+
+        # ---- long prompts, one stream: TTFT, implied prefill throughput, decode throughput ----
+        if prefill_lens:
+            async def long_prompts():
+                rows = []
+                async with httpx.AsyncClient() as client:
+                    for n in [int(v) for v in prefill_lens.split(",")]:
+                        row = await _sweep_level(client, url, [_random_ids(n, vocab, seed=20_000 + n + i) for i in range(2)],
+                                                 128, 1)       # 2 requests one after the other, 128 new tokens each
+                        ttft, tpot = row.ttft["median"], row.tpot["median"]
+                        rows.append({"prompt_tokens": n, "ttft_ms": ttft * 1000, "prefill_tok_s": n / ttft,
+                                     "tpot_ms": tpot * 1000, "decode_tok_s": 1 / tpot})
+                        r = rows[-1]
+                        print(f"  [long] {n:6d} prompt tokens: TTFT {r['ttft_ms']:8.1f} ms, prefill {r['prefill_tok_s']:8.0f} tok/s, "
+                              f"decode {r['decode_tok_s']:6.1f} tok/s ({r['tpot_ms']:.2f} ms/token)", flush=True)
+                return rows
+            result["long"] = asyncio.run(long_prompts())
     finally:
         _stop_server(proc)
         total = time.time() - t_start
