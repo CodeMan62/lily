@@ -20,6 +20,7 @@ class GenerateReqInput:
     rid: Optional[str] = None
     is_chat: bool = False
     chat_template_kwargs: Optional[Dict[str, Any]] = None
+    tools: Optional[List[Dict[str, Any]]] = None  # OpenAI tool schemas; None = no tool parsing
 
     def to_sampling_params(self) -> SamplingParams:
         params = dict(self.sampling_params or {})

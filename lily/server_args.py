@@ -55,6 +55,7 @@ class ServerArgs:
     port: int = 30000
     served_model_name: Optional[str] = None
     reasoning_parser: Optional[str] = None  # qwen3
+    tool_call_parser: Optional[str] = None  # hermes | qwen3_coder | glm; None = detect from the chat template
     log_level: str = "info"
     random_seed: Optional[int] = None
 

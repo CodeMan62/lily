@@ -9,6 +9,7 @@ splitting `<think>` reasoning content on the way out.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 from typing import Any, AsyncIterator, Dict, List, Optional
@@ -22,8 +23,31 @@ from lily.scheduler.io_struct import (
     TokenizedGenerateReqInput,
 )
 from lily.parsers.reasoning_parser import ReasoningParser
+from lily.parsers.tool_parser import ToolParser, detect_tool_format
 
 logger = logging.getLogger(__name__)
+
+
+def template_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """OpenAI sends tool-call arguments as a JSON string (and content None beside them);
+    chat templates iterate the arguments as a dict and concatenate content as a string."""
+    out = []
+    for m in messages:
+        if m.get("tool_calls"):
+            calls = []
+            for tc in m["tool_calls"]:
+                fn = dict(tc.get("function") or {})
+                if isinstance(fn.get("arguments"), str):
+                    try:
+                        fn["arguments"] = json.loads(fn["arguments"] or "{}")
+                    except ValueError:
+                        pass
+                calls.append(dict(tc, function=fn))
+            m = dict(m, tool_calls=calls)
+        if m.get("content") is None:
+            m = dict(m, content="")
+        out.append(m)
+    return out
 
 
 class TokenizerFrontend:
@@ -31,6 +55,8 @@ class TokenizerFrontend:
         self.tokenizer = tokenizer
         self.server_args = server_args
         self.model_name = server_args.served_model_name or server_args.model_path
+        self.tool_format = server_args.tool_call_parser or detect_tool_format(
+            getattr(tokenizer, "chat_template", None))
 
         context = zmq.Context.instance()
         self.to_scheduler = context.socket(zmq.PUSH)
@@ -91,8 +117,10 @@ class TokenizerFrontend:
             if obj.messages is None:
                 raise ValueError("chat request requires messages")
             kwargs = dict(obj.chat_template_kwargs or {})
+            if obj.tools:
+                kwargs["tools"] = obj.tools
             ids = self.tokenizer.apply_chat_template(
-                obj.messages, add_generation_prompt=True, tokenize=True, **kwargs
+                template_messages(obj.messages), add_generation_prompt=True, tokenize=True, **kwargs
             )
             # transformers may return a plain list or a BatchEncoding.
             if not isinstance(ids, list):
@@ -110,6 +138,13 @@ class TokenizerFrontend:
             thinking = False
         return ReasoningParser(thinking=thinking)
 
+    def tool_parser(self, obj: GenerateReqInput) -> Optional[ToolParser]:
+        if not obj.tools:
+            return None
+        if self.tool_format is None:
+            raise ValueError("tools given but the chat template has no tool-call format; set --tool-call-parser")
+        return ToolParser(self.tool_format, obj.tools)
+
     def _send(self, rid: str, obj: GenerateReqInput) -> None:
         input_ids = self.tokenize(obj)
         self.to_scheduler.send_pyobj(
@@ -117,7 +152,8 @@ class TokenizerFrontend:
         )
 
     async def generate_request(self, obj: GenerateReqInput) -> AsyncIterator[Dict[str, Any]]:
-        """Yield `{"text", "reasoning_content", "meta_info"}` chunks for one request."""
+        """Yield `{"text", "reasoning_content", "tool_calls", "meta_info"}` chunks for one request."""
+        parsers = (self._reasoning_parser(obj), self.tool_parser(obj))
         rid = obj.rid or self._next_rid()
         queue: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
         self.rid_to_queue[rid] = queue
@@ -127,46 +163,58 @@ class TokenizerFrontend:
             self.rid_to_queue.pop(rid, None)
             raise
 
-        parser = self._reasoning_parser(obj)
         try:
             if obj.stream:
-                async for chunk in self._stream(rid, queue, parser):
+                async for chunk in self.stream_chunks(queue, parsers):
                     yield chunk
             else:
-                yield await self._collect(rid, queue, parser)
+                yield await self.collect(queue, parsers)
         finally:
             self.rid_to_queue.pop(rid, None)
 
-    async def _stream(self, rid, queue, parser) -> AsyncIterator[Dict[str, Any]]:
+    @staticmethod
+    def split_output(parsers, text: str, finished: bool):
+        """Split new text into (reasoning, content, tool calls); `finished` flushes held-back text."""
+        reasoning_parser, tool_parser = parsers
+        reasoning, content = reasoning_parser.parse_stream_chunk(text)
+        if finished:
+            r, c = reasoning_parser.flush()
+            reasoning += r
+            content += c
+        calls: List[Dict[str, str]] = []
+        if tool_parser is not None:
+            content, calls = tool_parser.parse_stream_chunk(content)
+            if finished:
+                c, more = tool_parser.flush()
+                content += c
+                calls += more
+        return reasoning, content, calls
+
+    async def stream_chunks(self, queue, parsers) -> AsyncIterator[Dict[str, Any]]:
         while True:
             item = await queue.get()
-            reasoning, content = parser.parse_stream_chunk(item["text"])
             finished = "finish_reason" in item["meta_info"]
-            if finished:
-                r, c = parser.flush()
-                reasoning += r
-                content += c
-            if reasoning or content or finished:
-                yield {"text": content, "reasoning_content": reasoning, "meta_info": item["meta_info"]}
+            reasoning, content, calls = self.split_output(parsers, item["text"], finished)
+            if reasoning or content or calls or finished:
+                yield {"text": content, "reasoning_content": reasoning, "tool_calls": calls,
+                       "meta_info": item["meta_info"]}
             if finished:
                 return
 
-    async def _collect(self, rid, queue, parser) -> Dict[str, Any]:
-        reasoning = ""
-        content = ""
-        meta_info: Dict[str, Any] = {}
+    async def collect(self, queue, parsers) -> Dict[str, Any]:
+        reasoning, content, calls = "", "", []
         while True:
             item = await queue.get()
-            r, c = parser.parse_stream_chunk(item["text"])
+            finished = "finish_reason" in item["meta_info"]
+            r, c, t = self.split_output(parsers, item["text"], finished)
             reasoning += r
             content += c
-            meta_info = item["meta_info"]
-            if "finish_reason" in meta_info:
-                r, c = parser.flush()
-                reasoning += r
-                content += c
-                break
-        return {"text": content, "reasoning_content": reasoning, "meta_info": meta_info}
+            calls += t
+            if finished:
+                if calls:
+                    content = content.strip()
+                return {"text": content, "reasoning_content": reasoning, "tool_calls": calls,
+                        "meta_info": item["meta_info"]}
 
     # ---- control -----------------------------------------------------------
 

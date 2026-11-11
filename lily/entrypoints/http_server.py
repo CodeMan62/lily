@@ -58,6 +58,8 @@ class ChatCompletionRequest(_SamplingRequest):
     logprobs: bool = False
     top_logprobs: Optional[int] = None
     chat_template_kwargs: Optional[Dict[str, Any]] = None
+    tools: Optional[List[Dict[str, Any]]] = None
+    tool_choice: Optional[Union[str, Dict[str, Any]]] = None  # auto | none (no constrained decoding)
 
 
 class GenerateRequest(BaseModel):
@@ -98,6 +100,17 @@ def _sampling_params(body: Any) -> Dict[str, Any]:
         if getattr(body, "top_logprobs", None):
             params["top_logprobs"] = body.top_logprobs
     return params
+
+
+def tool_calls_json(calls: List[Dict[str, str]], start: int = 0) -> List[Dict[str, Any]]:
+    return [{"index": start + i, "id": f"call_{uuid.uuid4().hex[:24]}", "type": "function",
+             "function": {"name": c["name"], "arguments": c["arguments"]}}
+            for i, c in enumerate(calls)]
+
+
+def chat_finish_reason(meta: Dict[str, Any], called_tools: bool) -> Optional[str]:
+    reason = _finish_reason(meta.get("finish_reason"))
+    return "tool_calls" if reason == "stop" and called_tools else reason
 
 
 def _sse(payload: Dict[str, Any]) -> str:
@@ -215,9 +228,12 @@ def create_app(frontend, server_args) -> FastAPI:
 
     @app.post("/v1/chat/completions")
     async def chat_completions(body: ChatCompletionRequest, request: Request):
+        if body.tool_choice not in (None, "auto", "none"):
+            return JSONResponse({"error": "tool_choice must be 'auto' or 'none'"}, status_code=400)
         rid = f"chatcmpl-{uuid.uuid4().hex}"
         obj = GenerateReqInput(
             messages=body.messages, is_chat=True, chat_template_kwargs=body.chat_template_kwargs,
+            tools=None if body.tool_choice == "none" else body.tools,
             sampling_params=_sampling_params(body), stream=body.stream, rid=rid,
         )
         created = int(time.time())
@@ -225,20 +241,26 @@ def create_app(frontend, server_args) -> FastAPI:
         if not body.stream:
             async for chunk in frontend.generate_request(obj):
                 meta = chunk["meta_info"]
-                message: Dict[str, Any] = {"role": "assistant", "content": chunk["text"]}
+                calls = chunk["tool_calls"]
+                # OpenAI returns content null beside tool calls when there is no text.
+                content = chunk["text"] or (None if calls else "")
+                message: Dict[str, Any] = {"role": "assistant", "content": content}
                 if chunk["reasoning_content"]:
                     message["reasoning_content"] = chunk["reasoning_content"]
+                if calls:
+                    message["tool_calls"] = tool_calls_json(calls)
                 return JSONResponse({
                     "id": rid, "object": "chat.completion", "created": created, "model": model_name,
                     "choices": [{
                         "index": 0, "message": message,
-                        "finish_reason": _finish_reason(meta.get("finish_reason")),
+                        "finish_reason": chat_finish_reason(meta, bool(calls)),
                     }],
                     "usage": _usage(meta),
                 })
 
         async def stream():
             first = True
+            num_calls = 0
             async for chunk in frontend.generate_request(obj):
                 if await request.is_disconnected():
                     frontend.abort(rid)
@@ -252,11 +274,14 @@ def create_app(frontend, server_args) -> FastAPI:
                     delta["reasoning_content"] = chunk["reasoning_content"]
                 if chunk["text"]:
                     delta["content"] = chunk["text"]
+                if chunk["tool_calls"]:
+                    delta["tool_calls"] = tool_calls_json(chunk["tool_calls"], num_calls)
+                    num_calls += len(chunk["tool_calls"])
                 yield _sse({
                     "id": rid, "object": "chat.completion.chunk", "created": created, "model": model_name,
                     "choices": [{
                         "index": 0, "delta": delta,
-                        "finish_reason": _finish_reason(meta.get("finish_reason")),
+                        "finish_reason": chat_finish_reason(meta, num_calls > 0),
                     }],
                 })
             yield "data: [DONE]\n\n"
