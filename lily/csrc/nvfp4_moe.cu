@@ -91,8 +91,12 @@ nvfp4_moe_gemm_kernel(const __nv_bfloat16* __restrict__ x,    // [T, K]
                       const int32_t* __restrict__ offsets,     // [E + 1] CSR over sorted (token, slot) pairs
                       const int32_t* __restrict__ tokens,      // [R] token index of each sorted pair
                       __nv_bfloat16* __restrict__ out,         // [R, N] one row per sorted pair
-                      int N, int K) {
+                      float* __restrict__ partial,             // [splits, R, N] fp32 partial sums (split K only)
+                      int* __restrict__ tile_done,             // [E_active_max * n_tiles] zeroed arrival counts (split K only)
+                      int N, int K, int R) {
     const int e_slot = blockIdx.y;
+    const int split = blockIdx.z, splits = gridDim.z;           // this block's slice of K
+    const int k_len = K / splits, k_beg = split * k_len, k_end = k_beg + k_len;
     const int e = active_experts[e_slot];
     if (e < 0) return;
 
@@ -109,7 +113,7 @@ nvfp4_moe_gemm_kernel(const __nv_bfloat16* __restrict__ x,    // [T, K]
     auto fill = [&] {
 #pragma unroll
         for (int d = 0; d < PREFETCH; ++d) {
-            const int k = min(d * SUPER_K, K - SUPER_K);
+            const int k = k_beg + min(d * SUPER_K, k_len - SUPER_K);
             ring[d] = load_stream(wrow + (k + 32 * t) / 2);
             ring_s[d] = *reinterpret_cast<const uint16_t*>(srow + (k + 32 * t) / 16);
         }
@@ -130,15 +134,15 @@ nvfp4_moe_gemm_kernel(const __nv_bfloat16* __restrict__ x,    // [T, K]
         const int va = ra < r1, vb = rb < r1;
         float acc[4] = {0.f, 0.f, 0.f, 0.f};
 
-        for (int k0 = 0; k0 < K; k0 += PREFETCH * SUPER_K) {
+        for (int k0 = k_beg; k0 < k_end; k0 += PREFETCH * SUPER_K) {
 #pragma unroll
           for (int d = 0; d < PREFETCH; ++d) {
             const int ks = k0 + d * SUPER_K;
-            if (ks >= K) break;
+            if (ks >= k_end) break;
             const uint4 packed = ring[d];
             const uint32_t s2 = ring_s[d];
             const int kn = ks + PREFETCH * SUPER_K;
-            if (kn < K) {
+            if (kn < k_end) {
                 ring[d] = load_stream(wrow + (kn + 32 * t) / 2);
                 ring_s[d] = *reinterpret_cast<const uint16_t*>(srow + (kn + 32 * t) / 16);
             }
@@ -163,6 +167,12 @@ nvfp4_moe_gemm_kernel(const __nv_bfloat16* __restrict__ x,    // [T, K]
           }
         }
         // C fragment -> pair rows ra (acc[0], acc[1]) and rb (acc[2], acc[3]) at columns n0, n1
+        if (splits > 1) {
+            float* p = partial + (size_t)split * R * N;
+            if (va) { p[(size_t)ra * N + n0] = acc[0]; p[(size_t)ra * N + n1] = acc[1]; }
+            if (vb) { p[(size_t)rb * N + n0] = acc[2]; p[(size_t)rb * N + n1] = acc[3]; }
+            continue;
+        }
         if (va) {
             if (n0 < N) out[(size_t)ra * N + n0] = __float2bfloat16(acc[0] * inv0);
             if (n1 < N) out[(size_t)ra * N + n1] = __float2bfloat16(acc[1] * inv1);
@@ -171,6 +181,22 @@ nvfp4_moe_gemm_kernel(const __nv_bfloat16* __restrict__ x,    // [T, K]
             if (n0 < N) out[(size_t)rb * N + n0] = __float2bfloat16(acc[2] * inv0);
             if (n1 < N) out[(size_t)rb * N + n1] = __float2bfloat16(acc[3] * inv1);
         }
+    }
+    if (splits == 1) return;
+    // split K: the last of the tile's `splits` blocks to arrive adds the partials in split order (deterministic)
+    __threadfence();
+    __syncthreads();
+    __shared__ int last;
+    if (threadIdx.x == 0) last = atomicAdd(tile_done + (size_t)e_slot * gridDim.x + blockIdx.x, 1) == splits - 1;
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    const int col0 = blockIdx.x * ROWS_PER_BLOCK;
+    for (int i = threadIdx.x; i < (r1 - r0) * ROWS_PER_BLOCK; i += THREADS) {
+        const int r = r0 + i / ROWS_PER_BLOCK, n = col0 + i % ROWS_PER_BLOCK;
+        float sum = 0.f;
+        for (int z = 0; z < splits; ++z) sum += __ldcg(partial + ((size_t)z * R + r) * N + n);
+        out[(size_t)r * N + n] = __float2bfloat16(sum * (1.f / gscale[(size_t)e * gs_rows + (gs_rows == 1 ? 0 : n)]));
     }
 }
 
@@ -196,11 +222,27 @@ torch::Tensor nvfp4_moe_gemm(torch::Tensor x, torch::Tensor w, torch::Tensor sca
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     auto out = torch::empty({num_rows, N}, x.options());
     if (num_rows == 0 || active_experts.numel() == 0) return out;
-    const dim3 grid((unsigned)((N + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK), (unsigned)active_experts.numel());
+    const int n_tiles = (int)((N + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
+    // A decode batch (a few tokens over ~60 experts) fills just over one wave, so the second runs nearly empty:
+    // under two waves of blocks, split K so the grid is several short waves instead.
+    const int64_t blocks = (int64_t)n_tiles * active_experts.numel();
+    const int slots = at::cuda::getCurrentDeviceProperties()->multiProcessorCount * MIN_BLOCKS;
+    int splits = 1;
+    if (N % ROWS_PER_BLOCK == 0 && blocks < 2 * slots)
+        for (int s : {4, 2})
+            if (K % (s * PREFETCH * SUPER_K) == 0) { splits = s; break; }
+    torch::Tensor partial, tile_done;
+    if (splits > 1) {
+        partial = torch::empty({splits, num_rows, N}, x.options().dtype(torch::kFloat32));
+        tile_done = torch::zeros({blocks}, x.options().dtype(torch::kInt32));
+    }
+    const dim3 grid((unsigned)n_tiles, (unsigned)active_experts.numel(), (unsigned)splits);
     nvfp4_moe_gemm_kernel<<<grid, THREADS, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()), w.data_ptr<uint8_t>(), scale.data_ptr<uint8_t>(),
         gscale.data_ptr<float>(), gs_rows, active_experts.data_ptr<int32_t>(), offsets.data_ptr<int32_t>(),
-        tokens.data_ptr<int32_t>(), reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()), (int)N, (int)K);
+        tokens.data_ptr<int32_t>(), reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
+        splits > 1 ? partial.data_ptr<float>() : nullptr, splits > 1 ? tile_done.data_ptr<int>() : nullptr,
+        (int)N, (int)K, (int)num_rows);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
