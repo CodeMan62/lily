@@ -5,6 +5,8 @@
     modal run scripts/modal_glm5.py::bench        # 4x RTX PRO 6000 ($3.03/h each): serve, check one
                                                   # reply, measure tok/s at concurrency 1 and 8, exit
     modal run scripts/modal_glm5.py::test         # 2x RTX PRO 6000: the GLM test suite on tiny models
+    modal run scripts/modal_glm5.py::profile      # 4x RTX PRO 6000: per-kernel GPU time per round at bs 1 and 16
+                                                  # only (no sweeps), hard-capped at PROFILE_BUDGET_USD
 
 The image compiles lily's CUDA kernels for sm_120 at build time (CPU, no GPU billed), so the GPU
 run only loads weights (~5 min), warms up and benchmarks. `bench` is hard-capped by its timeout.
@@ -105,11 +107,12 @@ def _generate_probe(base: str) -> bool:
         return False
 
 
-def _start_server(spec: str, log_path: str, t0: float, k: int = 0, graph_bs: int = 8, context_len: int = 32768) -> subprocess.Popen:
+def _start_server(spec: str, log_path: str, t0: float, k: int = 0, graph_bs: int = 8, context_len: int = 32768,
+                  extra: tuple = ()) -> subprocess.Popen:
     cmd = ["lily-serve", "--model-path", MODEL_DIR, "--served-model-name", "glm", "--tp-size", "4",
            "--quantize-lm-head", "nvfp4", "--mamba-ssm-dtype", "bfloat16", "--context-length", str(context_len),
            "--max-running-requests", "16", "--max-total-tokens", "131072", "--cuda-graph-max-bs", str(graph_bs),
-           "--mem-fraction-static", "0.8", "--port", str(PORT)]
+           "--mem-fraction-static", "0.8", "--port", str(PORT), *extra]
     if spec == "dflash":
         cmd += ["--speculative-algorithm", "DFLASH", "--speculative-draft-model-path", DRAFT_DIR]
     elif spec:
@@ -299,9 +302,90 @@ def bench(input_len: int = 256, output_len: int = 256, concurrency: str = "1,8",
 
 
 
+def profile_tables(log: str) -> list:
+    """The DecodeProfiler tables in a server log: each 'profile of ...' line plus its header and kernel rows."""
+    import re
+
+    tables, cur = [], None
+    for line in log.splitlines():
+        if "profile of" in line:
+            cur = [line[line.index("profile of"):]]
+            tables.append(cur)
+        elif cur is not None and (line.startswith(" ms/step") or re.match(r"^\s*\d+\.\d+\s", line)):
+            cur.append(line)
+        else:
+            cur = None
+    return ["\n".join(t) for t in tables]
+
+
+PROFILE_BUDGET_USD = 0.80
+# 4 GPUs + 16 cores + 64 GiB at Modal list prices; the timeout kills the run before it costs more than the budget
+PROFILE_HOUR_USD = GPU_HOUR_USD + 16 * 0.0472 + 64 * 0.008
+
+
+@app.function(image=image, volumes={"/models": vol}, gpu=GPU, cpu=16, memory=65536,
+              timeout=int(PROFILE_BUDGET_USD / PROFILE_HOUR_USD * 3600))
+def profile(spec: str = "dflash", k: int = 7, sizes: str = "1,16", output_len: int = 256,
+            env: str = "NCCL_P2P_LEVEL=SYS,LILY_P2P_AR=1", trace: bool = False) -> None:
+    """Rank 0's per-kernel GPU time per round at each batch size in `sizes`, nothing else: graphs are captured for
+    those sizes only, no chat probe, no sweeps. `trace`: also chrome traces of every rank into results/ (slower)."""
+    import asyncio
+
+    import httpx
+
+    t0 = time.time()
+    os.environ["LILY_PROFILE_BS"] = sizes
+    if trace:
+        os.environ["LILY_PROFILE_TRACE"] = "/models/results"
+        os.environ["LILY_PROFILE_ALL_RANKS"] = "1"
+    for kv in filter(None, env.split(",")):
+        key, _, value = kv.partition("=")
+        os.environ[key] = value
+    levels = [int(x) for x in sizes.split(",")]
+    log_path = "/tmp/lily-serve.log"
+    proc = _start_server(spec, log_path, t0, k, max(levels), extra=("--cuda-graph-bs", *map(str, levels)))
+    try:
+        base = f"http://127.0.0.1:{PORT}"
+        _wait_ready(proc, base, log_path, t0, int(PROFILE_BUDGET_USD / PROFILE_HOUR_USD * 3600) - 30)
+        print(f"\n=== server ready after {time.time() - t0:.0f}s ===\n", flush=True)
+        real = _real_prompts()
+        body = lambda ids: {"input_ids": ids, "sampling_params": {"max_new_tokens": output_len, "ignore_eos": True,  # noqa: E731
+                                                                   "temperature": 0.0}}
+
+        async def level(n):            # n requests at once: the profiler takes 20 rounds once n are decoding
+            async with httpx.AsyncClient(timeout=300) as client:
+                await asyncio.gather(*(client.post(f"{base}/generate", json=body(real[i % len(real)])) for i in range(n)))
+
+        for n in levels:
+            asyncio.run(level(n))
+        time.sleep(2)                  # the last table is logged as its window closes
+    finally:
+        _stop_server(proc)
+        tables = profile_tables(open(log_path, errors="replace").read())
+        total = time.time() - t0
+        print("\n\n".join(tables) or "no profile tables (see log above)")
+        print(f"\n=== {total:.0f}s on {GPU} ~ ${total / 3600 * PROFILE_HOUR_USD:.2f} ===", flush=True)
+        os.makedirs("/models/results", exist_ok=True)
+        open(f"/models/results/profile-{int(t0)}.txt", "w").write("\n\n".join(tables))
+        vol.commit()
+
+
 @app.function(image=image, gpu="RTX-PRO-6000:2", cpu=8, memory=32768, timeout=15 * 60)
 def test(target: str = "tests/test_glm5.py") -> None:
     subprocess.run([sys.executable, "-m", "pytest", "-x", "-q", *target.split()], check=True, cwd="/app")
+
+
+@app.function(image=image, gpu="RTX-PRO-6000:1", cpu=8, memory=32768, timeout=10 * 60)
+def fusionbench() -> None:
+    """Old vs fused kernel paths at GLM per-card shapes on one card (bench/fusion_bench.py)."""
+    subprocess.run([sys.executable, "bench/fusion_bench.py"], check=True, cwd="/app")
+
+
+@app.function(image=image, gpu=GPU, cpu=16, memory=65536, timeout=5 * 60)
+def arbench() -> None:
+    """One-shot P2P all-reduce vs NCCL on the 4 cards (bench/p2p_ar_bench.py); killed after 2 minutes if it hangs."""
+    env = {**os.environ, "LILY_P2P_AR": "1", "NCCL_P2P_LEVEL": "SYS"}
+    subprocess.run(["torchrun", "--nproc-per-node", "4", "bench/p2p_ar_bench.py"], check=True, cwd="/app", env=env, timeout=120)
 
 
 @app.function(image=image, volumes={"/models": vol}, cpu=8, memory=98304, timeout=3600)
