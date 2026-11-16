@@ -9,6 +9,7 @@ from typing import Optional
 import torch
 
 from lily.distributed import all_reduce_min_int, init_distributed_environment
+from lily.distributed.distributed import init_p2p_allreduce
 from lily.layers.quantization import build_quant_config
 from lily.models.model_config import ModelConfig
 from lily.layers.attention.torch_native_backend import TorchNativeAttnBackend
@@ -49,6 +50,8 @@ class ModelRunner:
             self.device = torch.device("cuda", server_args.base_gpu_id + tp_rank)
         init_distributed_environment(self.tp_size, tp_rank, server_args.dist_init_addr, self.device,
                                      backend=server_args.dist_backend)
+        if init_p2p_allreduce():
+            logger.info("one-shot P2P all-reduce on (tp rank %d)", tp_rank)
         self.num_attention_heads = model_config.get_num_attention_heads(self.tp_size)
         self.num_kv_heads = model_config.get_num_kv_heads(self.tp_size)
         self.dtype = model_config.dtype

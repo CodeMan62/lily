@@ -57,8 +57,40 @@ def get_tp_info() -> tuple[int, int]:
 # ---- activation collectives (NCCL) ----------------------------------------
 
 
+P2P = None      # (module, device array of every rank's buffer, max bytes) once init_p2p_allreduce ran
+
+
+def init_p2p_allreduce() -> bool:
+    """`LILY_P2P_AR=1`: one-shot all-reduce over PCIe peer-to-peer for small bf16 tensors (csrc/p2p_allreduce.cu),
+    when every GPU pair can map the other's memory. Collective: every rank must call it. Returns whether it is on."""
+    global P2P
+    import os
+
+    if _TP_SIZE == 1 or _BACKEND != "nccl" or not os.environ.get("LILY_P2P_AR"):
+        return False
+    from lily.layers.quantization import cuda_ops
+
+    mod = cuda_ops._module()
+    dev = torch.cuda.current_device()
+    ok = mod is not None and all(torch.cuda.can_device_access_peer(dev, p) for p in range(torch.cuda.device_count()) if p != dev)
+    oks: List[Any] = [None] * _TP_SIZE
+    dist.all_gather_object(oks, ok, group=_CPU_GROUP)
+    if not all(oks):
+        return False
+    own = mod.p2p_alloc(_TP_SIZE)[0]
+    handles: List[Any] = [None] * _TP_SIZE
+    dist.all_gather_object(handles, mod.p2p_handle(own).tolist(), group=_CPU_GROUP)
+    ptrs = [own if r == _TP_RANK else mod.p2p_open(torch.tensor(h, dtype=torch.uint8)) for r, h in enumerate(handles)]
+    P2P = (mod, torch.tensor(ptrs, dtype=torch.int64, device=f"cuda:{dev}"), mod.p2p_max_bytes())
+    dist.barrier(group=_CPU_GROUP)
+    return True
+
+
 def tensor_model_parallel_all_reduce(x: torch.Tensor) -> torch.Tensor:
     if _TP_SIZE == 1:
+        return x
+    if P2P is not None and x.dtype == torch.bfloat16 and x.is_contiguous() and x.numel() % 8 == 0 and x.numel() * 2 <= P2P[2]:
+        P2P[0].p2p_allreduce(x, P2P[1], _TP_RANK, _TP_SIZE)
         return x
     dist.all_reduce(x, group=_DEVICE_GROUP)
     return x

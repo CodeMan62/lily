@@ -50,6 +50,17 @@ bool hc_fused_supported(int64_t hc_mult, int64_t H);
 std::vector<torch::Tensor> hc_collapse(torch::Tensor streams, torch::Tensor fn, torch::Tensor base, torch::Tensor scale,
                                        torch::Tensor norm_w, int64_t iters, double hc_eps, double rms_eps, double norm_eps);
 torch::Tensor hc_expand(torch::Tensor block_out, torch::Tensor post, torch::Tensor comb, torch::Tensor streams);
+std::vector<torch::Tensor> hc_expand_collapse(torch::Tensor block_out, torch::Tensor post, torch::Tensor comb, torch::Tensor streams,
+                                              torch::Tensor fn, torch::Tensor base, torch::Tensor scale, torch::Tensor norm_w,
+                                              torch::Tensor partial, torch::Tensor counter, int64_t iters, double hc_eps,
+                                              double rms_eps, double norm_eps);
+bool router_logits_supported(int64_t T, int64_t H);
+int64_t p2p_max_bytes();
+std::vector<int64_t> p2p_alloc(int64_t world);
+torch::Tensor p2p_handle(int64_t ptr);
+int64_t p2p_open(torch::Tensor handle);
+void p2p_allreduce(torch::Tensor x, torch::Tensor bufs, int64_t rank, int64_t world);
+torch::Tensor router_logits(torch::Tensor x, torch::Tensor w, torch::Tensor partial, torch::Tensor counter);
 
 bool moe_route_supported(int64_t T, int64_t k, int64_t E);
 std::vector<torch::Tensor> moe_route(torch::Tensor logits, torch::Tensor bias, int64_t k, double scaling, bool norm,
@@ -84,6 +95,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_combine", &moe_combine, "Weighted sum of the expert rows of each token, plus the shared expert");
     m.def("hc_fused_supported", &hc_fused_supported);
     m.def("hc_collapse", &hc_collapse, "mHC collapse: stream weights, Sinkhorn, weighted sum, RMSNorm");
+    m.def("hc_expand_collapse", &hc_expand_collapse, "mHC expand fused with the next weights + collapse + RMSNorm");
+    m.def("p2p_max_bytes", &p2p_max_bytes);
+    m.def("p2p_alloc", &p2p_alloc, "Zeroed one-shot all-reduce buffer (cudaMalloc) for this rank");
+    m.def("p2p_handle", &p2p_handle, "CUDA IPC handle of a p2p buffer");
+    m.def("p2p_open", &p2p_open, "Map a peer's p2p buffer");
+    m.def("p2p_allreduce", &p2p_allreduce, "One-shot in-place all-reduce of a small bf16 tensor over PCIe P2P");
+    m.def("router_logits_supported", &router_logits_supported);
+    m.def("router_logits", &router_logits, "Router logits for <= 16 bf16 rows against fp32 weights, split-K in one kernel");
     m.def("hc_expand", &hc_expand, "mHC expand: block output into the streams, streams mixed");
     m.def("mla_decode_supported", &mla_decode_supported);
     m.def("mla_decode_partials", &mla_decode_partials, "MLA decode over the latent cache: per-chunk online-softmax partials");

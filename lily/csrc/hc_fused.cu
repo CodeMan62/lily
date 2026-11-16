@@ -79,22 +79,18 @@ hc_weights_kernel(const __nv_bfloat16* __restrict__ streams, const __nv_bfloat16
 
 __device__ __forceinline__ float sigmoidf(float x) { return 1.f / (1.f + __expf(-x)); }
 
-// grid (T): lanes 0..15 of warp 0 hold comb[i][j], i = lane >> 2, j = lane & 3
-__global__ void __launch_bounds__(THREADS)
-hc_collapse_kernel(const __nv_bfloat16* __restrict__ streams, const float* __restrict__ w,
-                   const __nv_bfloat16* __restrict__ base, const __nv_bfloat16* __restrict__ scale,
-                   const __nv_bfloat16* __restrict__ norm_w, float* __restrict__ post_out,
-                   float* __restrict__ comb_out, __nv_bfloat16* __restrict__ collapsed,
-                   __nv_bfloat16* __restrict__ normed, int H, int iters, float hc_eps, float rms_eps, float norm_eps) {
-    __shared__ float pre[N];
-    __shared__ float red[THREADS / 32];
-    #if __CUDA_ARCH__ >= 900
-    asm volatile("griddepcontrol.launch_dependents;");
-    #endif  // the next GEMM may start streaming its weights
-    const int t = blockIdx.x;
+template <bool COHERENT>
+__device__ __forceinline__ uint4 ld(const uint4* p) { if constexpr (COHERENT) return __ldcg(p); else return *p; }
+
+// One token's collapse from its weight logits `wt` [W + 1]: lanes 0..15 of warp 0 hold comb[i][j], i = lane >> 2, j = lane & 3.
+// COHERENT: the streams were written by this grid (read through L2).
+template <bool COHERENT>
+__device__ __forceinline__ void collapse_token(int t, const float* wt, const __nv_bfloat16* streams, const __nv_bfloat16* base,
+                                               const __nv_bfloat16* scale, const __nv_bfloat16* norm_w, float* post_out,
+                                               float* comb_out, __nv_bfloat16* collapsed, __nv_bfloat16* normed, int H, int iters,
+                                               float hc_eps, float rms_eps, float norm_eps, float* pre, float* red) {
     if (threadIdx.x < 32) {
         const int lane = threadIdx.x;
-        const float* wt = w + (size_t)t * (W + 1);
         const float rs = rsqrtf(wt[W] / (float)(N * H) + rms_eps);
         const float s_pre = __bfloat162float(scale[0]), s_post = __bfloat162float(scale[1]), s_comb = __bfloat162float(scale[2]);
         if (lane < N) {
@@ -131,10 +127,10 @@ hc_collapse_kernel(const __nv_bfloat16* __restrict__ streams, const float* __res
     float ss = 0.f;
     for (int i = threadIdx.x; i < nv; i += THREADS) {
         float a[VEC], b[VEC], c[VEC], d[VEC], o[VEC];
-        unpack8(x[i], a);
-        unpack8(x[nv + i], b);
-        unpack8(x[2 * nv + i], c);
-        unpack8(x[3 * nv + i], d);
+        unpack8(ld<COHERENT>(x + i), a);
+        unpack8(ld<COHERENT>(x + nv + i), b);
+        unpack8(ld<COHERENT>(x + 2 * nv + i), c);
+        unpack8(ld<COHERENT>(x + 3 * nv + i), d);
 #pragma unroll
         for (int j = 0; j < VEC; ++j) {
             o[j] = round_bf16(p0 * a[j] + p1 * b[j] + p2 * c[j] + p3 * d[j]);
@@ -153,6 +149,115 @@ hc_collapse_kernel(const __nv_bfloat16* __restrict__ streams, const float* __res
         for (int j = 0; j < VEC; ++j) o[j] = g[j] * round_bf16(o[j] * inv);
         nout[i] = pack8(o);
     }
+}
+
+// grid (T)
+__global__ void __launch_bounds__(THREADS)
+hc_collapse_kernel(const __nv_bfloat16* __restrict__ streams, const float* __restrict__ w,
+                   const __nv_bfloat16* __restrict__ base, const __nv_bfloat16* __restrict__ scale,
+                   const __nv_bfloat16* __restrict__ norm_w, float* __restrict__ post_out,
+                   float* __restrict__ comb_out, __nv_bfloat16* __restrict__ collapsed,
+                   __nv_bfloat16* __restrict__ normed, int H, int iters, float hc_eps, float rms_eps, float norm_eps) {
+    __shared__ float pre[N];
+    __shared__ float red[THREADS / 32];
+    #if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;");
+    #endif  // the next GEMM may start streaming its weights
+    const int t = blockIdx.x;
+    collapse_token<false>(t, w + (size_t)t * (W + 1), streams, base, scale, norm_w, post_out, comb_out, collapsed, normed, H, iters,
+                          hc_eps, rms_eps, norm_eps, pre, red);
+}
+
+// Expand of one block's output into the streams, fused with the next hyper-connection's weights and collapse.
+// grid (S, T), S = ceil(H / VEC / FP) slices of FP vector positions: a block expands its slice of all 4 streams,
+// writes them, and leaves the slice's partial dot products with the W rows of fn (+ the sum of squares) in
+// `partial` [T, S, W + 1]; the token's last block (counter) sums the partials in slice order (deterministic,
+// the same on every TP rank) and runs the collapse. `counter` [T] goes back to 0 for the next call.
+constexpr int FP = 32;
+
+__global__ void __launch_bounds__(THREADS)
+hc_expand_collapse_kernel(const __nv_bfloat16* __restrict__ block_out, const float* __restrict__ post_in,
+                          const float* __restrict__ comb_in, const __nv_bfloat16* __restrict__ streams,
+                          __nv_bfloat16* __restrict__ out, const __nv_bfloat16* __restrict__ fn,
+                          const __nv_bfloat16* __restrict__ base, const __nv_bfloat16* __restrict__ scale,
+                          const __nv_bfloat16* __restrict__ norm_w, float* __restrict__ post_out,
+                          float* __restrict__ comb_out, __nv_bfloat16* __restrict__ collapsed,
+                          __nv_bfloat16* __restrict__ normed, float* __restrict__ partial, int* __restrict__ counter,
+                          int H, int iters, float hc_eps, float rms_eps, float norm_eps) {
+    __shared__ uint4 ns[N][FP];
+    __shared__ float wt[W + 1];
+    __shared__ float pre[N];
+    __shared__ float red[THREADS / 32];
+    __shared__ bool last;
+    #if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;");
+    #endif  // as hc_collapse_kernel: the next GEMM may start streaming its weights (its wait covers this whole grid)
+    const int sl = blockIdx.x, S = gridDim.x, t = blockIdx.y, nv = H / VEC;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, pos = sl * FP + lane;
+    // ---- expand: thread (n, lane) -> stream n at vector position pos (rounding as hc_expand_kernel)
+    if (threadIdx.x < N * FP) {
+        const int n = warp;
+        uint4 r4 = make_uint4(0u, 0u, 0u, 0u);
+        if (pos < nv) {
+            float sv[N][VEC], y[VEC], r[VEC], c[N];
+            const uint4* x = reinterpret_cast<const uint4*>(streams + (size_t)t * N * H);
+#pragma unroll
+            for (int m = 0; m < N; ++m) unpack8(x[m * nv + pos], sv[m]);
+            unpack8(reinterpret_cast<const uint4*>(block_out + (size_t)t * H)[pos], y);
+            const float pj = round_bf16(post_in[(size_t)t * N + n]);
+#pragma unroll
+            for (int m = 0; m < N; ++m) c[m] = round_bf16(comb_in[(size_t)t * N * N + m * N + n]);
+#pragma unroll
+            for (int j = 0; j < VEC; ++j) {
+                const float mix = round_bf16(c[0] * sv[0][j] + c[1] * sv[1][j] + c[2] * sv[2][j] + c[3] * sv[3][j]);
+                r[j] = round_bf16(pj * y[j]) + mix;
+            }
+            r4 = pack8(r);
+            reinterpret_cast<uint4*>(out + (size_t)t * N * H)[n * nv + pos] = r4;
+        }
+        ns[n][lane] = r4;
+    }
+    __syncthreads();
+    // ---- this slice's partial logits: warp w takes rows w, w + 8, ...; row W is the sum of squares
+    for (int r = warp; r <= W; r += THREADS / 32) {
+        float acc = 0.f;
+        if (pos < nv) {
+#pragma unroll
+            for (int n = 0; n < N; ++n) {
+                float a[VEC], f[VEC];
+                unpack8(ns[n][lane], a);
+                if (r < W) {
+                    unpack8(reinterpret_cast<const uint4*>(fn + (size_t)r * N * H)[n * nv + pos], f);
+#pragma unroll
+                    for (int j = 0; j < VEC; ++j) acc += a[j] * f[j];
+                } else {
+#pragma unroll
+                    for (int j = 0; j < VEC; ++j) acc += a[j] * a[j];
+                }
+            }
+        }
+#pragma unroll
+        for (int o = 16; o; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+        if (lane == 0) partial[((size_t)t * S + sl) * (W + 1) + r] = acc;
+    }
+    // ---- the token's last block collapses
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        last = atomicAdd(counter + t, 1) == S - 1;
+        if (last) counter[t] = 0;
+    }
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    if (threadIdx.x <= W) {
+        float acc = 0.f;
+        for (int i = 0; i < S; ++i) acc += __ldcg(partial + ((size_t)t * S + i) * (W + 1) + threadIdx.x);
+        wt[threadIdx.x] = acc;
+    }
+    __syncthreads();
+    collapse_token<true>(t, wt, out, base, scale, norm_w, post_out, comb_out, collapsed, normed, H, iters,
+                         hc_eps, rms_eps, norm_eps, pre, red);
 }
 
 // grid (ceil(H / VEC / THREADS), T)
@@ -210,6 +315,32 @@ std::vector<torch::Tensor> hc_collapse(torch::Tensor streams, torch::Tensor fn, 
                                                   reinterpret_cast<__nv_bfloat16*>(normed.data_ptr()), H, (int)iters,
                                                   (float)hc_eps, (float)rms_eps, (float)norm_eps);
     return {post, comb, collapsed, normed};
+}
+
+std::vector<torch::Tensor> hc_expand_collapse(torch::Tensor block_out, torch::Tensor post, torch::Tensor comb, torch::Tensor streams,
+                                              torch::Tensor fn, torch::Tensor base, torch::Tensor scale, torch::Tensor norm_w,
+                                              torch::Tensor partial, torch::Tensor counter, int64_t iters, double hc_eps,
+                                              double rms_eps, double norm_eps) {
+    TORCH_CHECK(block_out.is_contiguous() && post.is_contiguous() && comb.is_contiguous() && streams.is_contiguous() && fn.is_contiguous());
+    TORCH_CHECK(streams.dim() == 3 && streams.size(1) == N && streams.scalar_type() == at::kBFloat16 && fn.scalar_type() == at::kBFloat16);
+    const at::cuda::CUDAGuard guard(streams.device());
+    const int T = (int)streams.size(0), H = (int)streams.size(2), S = (H / VEC + FP - 1) / FP;
+    TORCH_CHECK(partial.scalar_type() == at::kFloat && partial.numel() >= (int64_t)T * S * (W + 1));
+    TORCH_CHECK(counter.scalar_type() == at::kInt && counter.numel() >= T);
+    auto f32 = streams.options().dtype(at::kFloat);
+    auto out = torch::empty_like(streams);
+    auto post2 = torch::empty({T, N}, f32);
+    auto comb2 = torch::empty({T, N, N}, f32);
+    auto collapsed = torch::empty({T, H}, streams.options());
+    auto normed = torch::empty({T, H}, streams.options());
+    if (T == 0) return {out, post2, comb2, normed};
+    auto bf = [](const torch::Tensor& x) { return reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()); };
+    hc_expand_collapse_kernel<<<dim3(S, T), THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+        bf(block_out), post.data_ptr<float>(), comb.data_ptr<float>(), bf(streams), reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+        bf(fn), bf(base), bf(scale), bf(norm_w), post2.data_ptr<float>(), comb2.data_ptr<float>(),
+        reinterpret_cast<__nv_bfloat16*>(collapsed.data_ptr()), reinterpret_cast<__nv_bfloat16*>(normed.data_ptr()),
+        partial.data_ptr<float>(), counter.data_ptr<int>(), H, (int)iters, (float)hc_eps, (float)rms_eps, (float)norm_eps);
+    return {out, post2, comb2, normed};
 }
 
 torch::Tensor hc_expand(torch::Tensor block_out, torch::Tensor post, torch::Tensor comb, torch::Tensor streams) {

@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 _CSRC = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "csrc")
 _SOURCES = [os.path.join(_CSRC, f) for f in ("bindings.cpp", "nvfp4_gemv.cu", "nvfp4_gemm_tc.cu", "nvfp4_moe.cu", "gdn_fused.cu",
                                                 "kda_fused.cu", "mla_decode.cu", "hc_fused.cu", "moe_fused.cu", "bf16_skinny.cu",
-                                                "small_fused.cu")]
+                                                "small_fused.cu", "p2p_allreduce.cu")]
 
 # Row-count routing for NVFP4 linears: the CUDA-core GEMV streams weights at HBM
 # bandwidth up to 4 rows; 5..16 rows go to the tensor-core GEMM (one dequant per
@@ -245,6 +245,21 @@ def moe_route(logits: torch.Tensor, bias: torch.Tensor, top_k: int, scaling: flo
     return _module().moe_route(logits, bias, int(top_k), float(scaling), bool(norm), int(offset), int(local_experts))
 
 
+def router_logits(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """fp32 [T, E] = x.float() @ w^T: one kernel for small batches (fixed-order split-K), cuBLAS otherwise."""
+    mod = _module()
+    if mod is not None and x.is_cuda and x.dtype == torch.bfloat16 and x.is_contiguous() and mod.router_logits_supported(*x.shape):
+        key = ("router", x.device, w.shape[0], x.shape[1])
+        scratch = SCRATCH.get(key)
+        if scratch is None and not torch.cuda.is_current_stream_capturing():
+            groups, splits = -(-w.shape[0] // 8), x.shape[1] // 512
+            scratch = SCRATCH[key] = (torch.empty(groups * splits * 8 * 16, dtype=torch.float32, device=x.device),
+                                      torch.zeros(groups, dtype=torch.int32, device=x.device))
+        if scratch is not None:
+            return mod.router_logits(x, w, *scratch)
+    return torch.nn.functional.linear(x.float(), w)
+
+
 def moe_swiglu(gate_up: torch.Tensor, limit: Optional[float]) -> torch.Tensor:
     """bf16 [rows, 2I] (gate | up) -> [rows, I]: silu(min(gate, limit)) * clamp(up, +-limit)."""
     return _module().moe_swiglu(gate_up, float("inf") if limit is None else float(limit))
@@ -272,6 +287,27 @@ def hc_collapse(streams: torch.Tensor, fn: torch.Tensor, base: torch.Tensor, sca
 def hc_expand(block_out: torch.Tensor, post: torch.Tensor, comb: torch.Tensor, streams: torch.Tensor) -> torch.Tensor:
     """-> bf16 [T, 4, H]: post[:, :, None] * block_out[:, None, :] + comb^T @ streams."""
     return _module().hc_expand(block_out.contiguous(), post, comb, streams)
+
+
+HC_FUSED_MAX_T = 1024
+SCRATCH: dict = {}      # self-resetting split-K scratch of the fused kernels, per (kind, device, shape)
+
+
+def hc_expand_collapse(block_out, post, comb, streams, fn, base, scale, norm_w, iters: int, hc_eps: float, rms_eps: float,
+                       norm_eps: float):
+    """`hc_expand` fused with the next `hc_collapse`: -> (new streams, post, comb, normed), or None when the batch
+    is too large or the scratch cannot be allocated now (inside a graph capture)."""
+    T, H = streams.shape[0], streams.shape[2]
+    S = -(-(H // 8) // 32)
+    key = ("hc", streams.device, S)
+    scratch = SCRATCH.get(key)
+    if T > HC_FUSED_MAX_T or (scratch is None and torch.cuda.is_current_stream_capturing()):
+        return None
+    if scratch is None:
+        scratch = SCRATCH[key] = (torch.empty(HC_FUSED_MAX_T * S * 25, dtype=torch.float32, device=streams.device),
+                                  torch.zeros(HC_FUSED_MAX_T, dtype=torch.int32, device=streams.device))
+    return _module().hc_expand_collapse(block_out.contiguous(), post, comb, streams, fn, base, scale, norm_w, *scratch,
+                                        int(iters), float(hc_eps), float(rms_eps), float(norm_eps))
 
 
 # ---- MLA decode + DSA selection (GLM-5.3-Flash) -------------------------------------------

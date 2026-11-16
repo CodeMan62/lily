@@ -74,6 +74,17 @@ class HyperConnection(nn.Module):
         post, comb, collapsed = self.collapse(streams)
         return post, comb, norm(collapsed)
 
+    def expand_collapse_norm(self, pending, streams: torch.Tensor, norm: RMSNorm):
+        """`expand(*pending, streams)` then this hyper-connection's `collapse_norm`, in one kernel when available:
+        (new streams, post, comb, normed)."""
+        if self.fused and streams.is_cuda:
+            out = cuda_ops.hc_expand_collapse(*pending, streams, self.fn.data, self.base.data, self.scale.data, norm.weight.data,
+                                              self.iters, self.eps, self.rms_eps, norm.variance_epsilon)
+            if out is not None:
+                return out
+        streams = HyperConnection.expand(*pending, streams)
+        return (streams, *self.collapse_norm(streams, norm))
+
     def collapse(self, streams: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         T = streams.shape[0]
         n = self.n
@@ -169,10 +180,11 @@ class KimiDeltaAttention(nn.Module):
         self.o_proj = RowParallelLinear(self.qkv_dim * tp_size, hidden_size, bias=False, params_dtype=torch.bfloat16)
 
     def forward(self, x: torch.Tensor, forward_batch: ForwardBatch, pool) -> torch.Tensor:
-        proj = self.qkv_proj(x)
-        f_a, g_a, beta = cuda_ops.bf16_linear(x, self.small_proj).split([self.head_dim, self.head_dim, self.num_heads], dim=-1)
-        gate = self.g_b_proj(g_a)
-        fgate = self.f_b_proj(f_a)
+        D, Q = self.head_dim, 3 * self.qkv_dim
+        y = cuda_ops.bf16_linear(x, self.in_proj)                      # [T, q | k | v | f_a | g_a | b], one GEMM
+        proj, beta = y[:, :Q], y[:, Q + 2 * D:]
+        gf = cuda_ops.bf16_linear(y[:, Q:Q + 2 * D], self.gate_proj)   # [T, gate | fgate]: block-diagonal g_b / f_b
+        gate, fgate = gf[:, :self.qkv_dim], gf[:, self.qkv_dim:]
         starts, lens, slots, fresh = forward_batch.linear_attention_meta()
         idx = self.state_layer_idx
         conv_snap = rec_snap = None
@@ -189,8 +201,17 @@ class KimiDeltaAttention(nn.Module):
         return self.o_proj(o)[0]
 
     def merge_small_projections(self) -> None:
-        """f_a, g_a and b read the same `x` and are too narrow to fill the GPU alone: one GEMM instead."""
-        self.small_proj = torch.cat([self.f_a_proj.weight.data, self.g_a_proj.weight.data, self.b_proj.weight.data]).contiguous()
+        """Two GEMMs per step instead of five: q/k/v, f_a, g_a and b read the same `x` (one weight, the q/k/v
+        projection becomes a view of it), and g_b / f_b become one block-diagonal GEMM over [f_a | g_a].
+        The skinny kernel computes every output row on its own, so the results are unchanged."""
+        qkv = self.qkv_proj.weight.data
+        self.in_proj = torch.cat([qkv, self.f_a_proj.weight.data, self.g_a_proj.weight.data, self.b_proj.weight.data]).contiguous()
+        self.qkv_proj.weight.data = self.in_proj[:qkv.shape[0]]
+        D, V = self.head_dim, self.qkv_dim
+        g = torch.zeros(2 * V, 2 * D, dtype=qkv.dtype, device=qkv.device)
+        g[:V, D:] = self.g_b_proj.weight.data
+        g[V:, :D] = self.f_b_proj.weight.data
+        self.gate_proj = g
 
     @property
     def _lower_bound(self) -> float:
@@ -582,17 +603,20 @@ class Glm5FlashDecoderLayer(nn.Module):
         else:
             self.mlp = ClampedMLP(H, g.intermediate_size, g.swiglu_limit, quant_config=quant_config, prefix=f"{prefix}.mlp")
 
-    def forward(self, streams: torch.Tensor, forward_batch: ForwardBatch, pool: MLATokenToKVPool, shared):
-        """`shared`: the last indexed MLA layer's selection, for layers that reuse it (see MLAAttention)."""
-        post, comb, h = self.attn_hc.collapse_norm(streams, self.input_layernorm)
+    def forward(self, streams: torch.Tensor, forward_batch: ForwardBatch, pool: MLATokenToKVPool, shared, pending=None):
+        """`shared`: the last indexed MLA layer's selection, for layers that reuse it (see MLAAttention).
+        `pending`: the previous layer's (block output, post, comb) not yet expanded into `streams`. Returns
+        (streams, shared, pending): this layer's last expand is left to the next layer, fused with its collapse."""
+        if pending is None:
+            post, comb, h = self.attn_hc.collapse_norm(streams, self.input_layernorm)
+        else:
+            streams, post, comb, h = self.attn_hc.expand_collapse_norm(pending, streams, self.input_layernorm)
         if self.is_linear:
             h = self.self_attn(h, forward_batch, pool.mamba_pool)
         else:
             h, shared = self.self_attn(h, forward_batch, pool.latent[self.layer_id], pool.index.get(self.layer_id), shared)
-        streams = HyperConnection.expand(h, post, comb, streams)
-        post, comb, h = self.ffn_hc.collapse_norm(streams, self.post_attention_layernorm)
-        h = self.mlp(h)
-        return HyperConnection.expand(h, post, comb, streams), shared
+        streams, post, comb, h = self.ffn_hc.expand_collapse_norm((h, post, comb), streams, self.post_attention_layernorm)
+        return streams, shared, (self.mlp(h), post, comb)
 
 
 class Glm5FlashModel(nn.Module):
@@ -613,10 +637,14 @@ class Glm5FlashModel(nn.Module):
         shared = None
         aux_layers = forward_batch.capture_aux_layers
         aux: List[torch.Tensor] = []
+        pending = None
         for i, layer in enumerate(self.layers):
-            streams, shared = layer(streams, forward_batch, pool, shared)
+            streams, shared, pending = layer(streams, forward_batch, pool, shared, pending)
             if aux_layers is not None and i in aux_layers:
+                streams, pending = HyperConnection.expand(*pending, streams), None
                 aux.append(streams.mean(dim=1))      # the drafter's context: streams contracted like the head
+        if pending is not None:
+            streams = HyperConnection.expand(*pending, streams)
         if aux_layers is not None:
             forward_batch.aux_hidden_states = torch.cat(aux, dim=-1)
         # Glm5NextTextHyperHead: unweighted mean of the streams, then the final norm.

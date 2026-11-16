@@ -23,6 +23,58 @@ constexpr int VEC = 8;
 
 __device__ __forceinline__ float round_bf16(float x) { return __bfloat162float(__float2bfloat16(x)); }
 
+// Router logits out[t, e] = x[t] . w[e] for <= RG_MAX_T rows (x bf16, w fp32): grid (H / RG_KS splits, E / RG_E groups),
+// one warp per expert over a 512-wide K slice with x in shared memory; the group's last block sums the split
+// partials in order (deterministic, the same on every TP rank) and resets its counter.
+constexpr int RG_E = 8, RG_KS = 512, RG_MAX_T = 16;
+
+__global__ void __launch_bounds__(RG_E * 32)
+router_logits_kernel(const __nv_bfloat16* __restrict__ x, const float* __restrict__ w, float* __restrict__ partial,
+                     int* __restrict__ counter, float* __restrict__ out, int T, int E, int H) {
+    __shared__ float xs[RG_MAX_T][RG_KS];
+    __shared__ bool last;
+    const int sp = blockIdx.x, S = gridDim.x, grp = blockIdx.y, k0 = sp * RG_KS;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, e = grp * RG_E + warp;
+    float4 wv[RG_KS / 128];
+    const float4* wr = reinterpret_cast<const float4*>(w + (size_t)min(e, E - 1) * H + k0);
+#pragma unroll
+    for (int j = 0; j < RG_KS / 128; ++j) wv[j] = __ldg(wr + lane + 32 * j);          // all weight loads in flight first
+    for (int i = threadIdx.x; i < T * RG_KS; i += RG_E * 32)
+        xs[i / RG_KS][i % RG_KS] = __bfloat162float(x[(size_t)(i / RG_KS) * H + k0 + i % RG_KS]);
+    __syncthreads();
+    float acc[RG_MAX_T];
+#pragma unroll
+    for (int t = 0; t < RG_MAX_T; ++t) {
+        float a = 0.f;
+        if (t < T) {
+#pragma unroll
+            for (int j = 0; j < RG_KS / 128; ++j) {
+                const float4 xv = *reinterpret_cast<const float4*>(&xs[t][4 * (lane + 32 * j)]);
+                a += wv[j].x * xv.x + wv[j].y * xv.y + wv[j].z * xv.z + wv[j].w * xv.w;
+            }
+        }
+        for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+        acc[t] = a;
+    }
+    if (lane == 0)
+        for (int t = 0; t < T; ++t) partial[(((size_t)grp * S + sp) * RG_E + warp) * RG_MAX_T + t] = acc[t];
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        last = atomicAdd(counter + grp, 1) == S - 1;
+        if (last) counter[grp] = 0;
+    }
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    const int we = threadIdx.x / RG_MAX_T, t = threadIdx.x % RG_MAX_T, ee = grp * RG_E + we;    // 8 experts x 16 rows
+    if (we < RG_E && t < T && ee < E) {
+        float sum = 0.f;
+        for (int i = 0; i < S; ++i) sum += __ldcg(partial + (((size_t)grp * S + i) * RG_E + we) * RG_MAX_T + t);
+        out[(size_t)t * E + ee] = sum;
+    }
+}
+
 __global__ void __launch_bounds__(ROUTE_THREADS)
 moe_route_kernel(const float* __restrict__ logits, const float* __restrict__ bias, int T, int E, int k, float scaling,
                  bool norm, int offset, int E_local, float* __restrict__ weights, int32_t* __restrict__ active,
@@ -184,6 +236,22 @@ __nv_bfloat16* bf_mut(torch::Tensor& x) { return reinterpret_cast<__nv_bfloat16*
 
 }  // namespace
 
+bool router_logits_supported(int64_t T, int64_t H) { return T <= RG_MAX_T && H % RG_KS == 0; }
+
+torch::Tensor router_logits(torch::Tensor x, torch::Tensor w, torch::Tensor partial, torch::Tensor counter) {
+    TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.is_contiguous() && x.scalar_type() == at::kBFloat16);
+    TORCH_CHECK(w.dim() == 2 && w.is_contiguous() && w.scalar_type() == at::kFloat && w.size(1) == x.size(1));
+    const int T = x.size(0), H = x.size(1), E = w.size(0), S = H / RG_KS, G = (E + RG_E - 1) / RG_E;
+    TORCH_CHECK(router_logits_supported(T, H) && partial.numel() >= (int64_t)G * S * RG_E * RG_MAX_T && counter.numel() >= G);
+    const c10::cuda::CUDAGuard guard(x.device());
+    auto out = torch::empty({T, E}, w.options());
+    if (T == 0) return out;
+    router_logits_kernel<<<dim3(S, G), RG_E * 32, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), w.data_ptr<float>(), partial.data_ptr<float>(),
+        counter.data_ptr<int>(), out.data_ptr<float>(), T, E, H);
+    return out;
+}
+
 bool moe_route_supported(int64_t T, int64_t k, int64_t E) { return T * k <= MAX_ROWS && k <= 32 && E <= 32 * MAX_PER_LANE; }
 
 // -> weights fp32 [T, k], active int32 [E_local], offsets int32 [E_local + 1], tokens int32 [T * k], inv int32 [T * k]
@@ -196,7 +264,7 @@ std::vector<torch::Tensor> moe_route(torch::Tensor logits, torch::Tensor bias, i
     auto weights = torch::empty({T, k}, logits.options());
     auto active = torch::empty({E_local}, i32);
     auto offsets = torch::empty({E_local + 1}, i32);
-    auto tokens = torch::zeros({T * k}, i32);
+    auto tokens = torch::empty({T * k}, i32);      // only the CSR rows offsets[e]..offsets[e+1] are read
     auto inv = torch::empty({T * k}, i32);
     moe_route_kernel<<<1, ROUTE_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
         logits.data_ptr<float>(), bias.data_ptr<float>(), T, E, (int)k, (float)scaling, norm, (int)offset, (int)E_local,

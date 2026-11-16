@@ -153,7 +153,7 @@ class NVFP4MoE(nn.Module):
         g, ex = self.gate, self.experts
 
         def routed():
-            logits = F.linear(x.float(), g.weight)
+            logits = cuda_ops.router_logits(x, g.weight)
             weights, active, offsets, tokens, inv = cuda_ops.moe_route(
                 logits, g.e_score_correction_bias, self.top_k, g.routed_scaling_factor, g.norm_topk_prob, 0, self.num_experts)
             R = x.shape[0] * self.top_k
